@@ -7,6 +7,7 @@
 #include "tt.h"
 #include "book.h"
 #include "evaluate.h"
+#include "nnue.h"
 
 #include <atomic>
 #include <chrono>
@@ -184,6 +185,11 @@ static void uci_setoption(std::istringstream& iss) {
         if (n < 1) n = 1;
         if (n > g_max_threads) n = g_max_threads;
         g_opts.threads = n;
+    } else if (name == "EvalFile") {
+        if (value.empty()) NNUE::unload();
+        else if (!NNUE::load(value)) {
+            std::cerr << "info string EvalFile load failed; using HCE\n";
+        }
     }
 }
 

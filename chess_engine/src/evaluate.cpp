@@ -3,6 +3,7 @@
 #include "evaluate.h"
 #include "board.h"
 #include "movegen.h"
+#include "nnue.h"
 
 namespace {
 
@@ -282,6 +283,9 @@ int mobility_term(const Board& b, Color us, bool eg) {
 }  // namespace
 
 int evaluate(const Board& b) {
+    // Dispatch: NNUE if a network is loaded, otherwise the hand-crafted eval.
+    if (NNUE::is_loaded()) return NNUE::evaluate(b);
+
     int mg[2] = { 0, 0 };
     int eg[2] = { 0, 0 };
     int phase = 0;
