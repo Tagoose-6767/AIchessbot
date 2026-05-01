@@ -5,3 +5,10 @@ __pycache__/
 .venv/
 *.bin
 selfplay.pgn
+
+# C++ build artifacts
+*.o
+*.obj
+*.exe
+build/
+chess_engine/chess_engine
