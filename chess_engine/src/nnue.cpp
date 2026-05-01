@@ -19,7 +19,34 @@
 #include <iostream>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#  include <immintrin.h>
+#  define NNUE_X86 1
+#else
+#  define NNUE_X86 0
+#endif
+
 namespace {
+
+// Runtime CPU dispatch. Detected once at startup; AVX2 paths are gated by it.
+bool g_use_avx2 = false;
+
+struct SimdInit {
+    SimdInit() {
+#if NNUE_X86 && (defined(__GNUC__) || defined(__clang__))
+        __builtin_cpu_init();
+        g_use_avx2 = __builtin_cpu_supports("avx2") != 0;
+#elif NNUE_X86 && defined(_MSC_VER)
+        int info[4]; __cpuid(info, 0);
+        if (info[0] >= 7) {
+            __cpuidex(info, 7, 0);
+            g_use_avx2 = (info[1] & (1 << 5)) != 0;
+        }
+#endif
+    }
+};
+SimdInit g_simd_init;
+
 
 constexpr uint32_t NN_VERSION   = 0x7AF32F16u;
 constexpr int      HALF_DIMS    = 256;
@@ -195,6 +222,67 @@ void refresh_perspective(const Board& b, Color persp, int16_t* acc) {
     }
 }
 
+// AVX2 helpers — gated by runtime g_use_avx2 detection. The target attribute
+// allows these to compile even when the TU isn't built with -mavx2; the
+// runtime check prevents calling them on non-AVX2 CPUs (which would SIGILL).
+#if NNUE_X86
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+static void add_col_avx2(int16_t* acc, const int16_t* col) {
+    // 256 int16 = 16 lanes × 16 int16 per __m256i.
+    for (int i = 0; i < HALF_DIMS / 16; ++i) {
+        __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i * 16));
+        __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(col + i * 16));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i * 16),
+                            _mm256_add_epi16(a, c));
+    }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+static void sub_col_avx2(int16_t* acc, const int16_t* col) {
+    for (int i = 0; i < HALF_DIMS / 16; ++i) {
+        __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i * 16));
+        __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(col + i * 16));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i * 16),
+                            _mm256_sub_epi16(a, c));
+    }
+}
+
+// Affine layer: in_dim must be a multiple of 32. uint8 inputs × int8 weights.
+// Pattern from Stockfish 12's AffineTransform::Propagate (AVX2 branch):
+// pmaddubsw → pmaddwd → accumulate to int32, then horizontal sum.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+static void affine_avx2(const uint8_t* input, const int8_t* weights,
+                        const int32_t* biases, int32_t* output,
+                        int in_dim, int out_dim) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int i = 0; i < out_dim; ++i) {
+        __m256i sum = _mm256_setzero_si256();
+        const int8_t* row = weights + size_t(i) * in_dim;
+        for (int j = 0; j < in_dim; j += 32) {
+            __m256i in_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + j));
+            __m256i w_v  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + j));
+            // Saturating int8×uint8 multiply with adjacent-pair int16 add.
+            __m256i prod = _mm256_maddubs_epi16(in_v, w_v);
+            // Then int16×1 multiply with adjacent-pair int32 add to widen.
+            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(prod, ones));
+        }
+        // Horizontal reduce: 8 int32 → 1.
+        sum = _mm256_hadd_epi32(sum, sum);
+        sum = _mm256_hadd_epi32(sum, sum);
+        int32_t total = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4);
+        output[i] = biases[i] + total;
+    }
+}
+
+#endif  // NNUE_X86
+
 // Helper: add or remove a single piece's feature column from one perspective.
 namespace {
 inline void add_feature(int16_t* acc, Color persp, Piece pc, int sq,
@@ -202,6 +290,13 @@ inline void add_feature(int16_t* acc, Color persp, Piece pc, int sq,
     if (type_of_piece(pc) == KING) return;            // kings excluded
     uint32_t feat = feature_idx(persp, pc, sq, ksq_oriented);
     const int16_t* col = &ft_weights_[size_t(feat) * HALF_DIMS];
+#if NNUE_X86
+    if (g_use_avx2) {
+        if (sign > 0) add_col_avx2(acc, col);
+        else          sub_col_avx2(acc, col);
+        return;
+    }
+#endif
     if (sign > 0)
         for (int h = 0; h < HALF_DIMS; ++h) acc[h] += col[h];
     else
@@ -324,11 +419,18 @@ int evaluate(const Board& b) {
 
     // 3. Affine 512 → 32 (int8 weights, int32 bias/output).
     int32_t l1[L1_OUT];
-    for (int i = 0; i < L1_OUT; ++i) {
-        int32_t sum = l1_biases_[i];
-        const int8_t* row = &l1_weights_[size_t(i) * L1_IN];
-        for (int j = 0; j < L1_IN; ++j) sum += int32_t(row[j]) * int32_t(input[j]);
-        l1[i] = sum;
+#if NNUE_X86
+    if (g_use_avx2) {
+        affine_avx2(input, l1_weights_.data(), l1_biases_.data(), l1, L1_IN, L1_OUT);
+    } else
+#endif
+    {
+        for (int i = 0; i < L1_OUT; ++i) {
+            int32_t sum = l1_biases_[i];
+            const int8_t* row = &l1_weights_[size_t(i) * L1_IN];
+            for (int j = 0; j < L1_IN; ++j) sum += int32_t(row[j]) * int32_t(input[j]);
+            l1[i] = sum;
+        }
     }
     // 4. ClippedReLU: >> 6, clamp [0, 127].
     uint8_t l1r[L1_OUT];
@@ -339,11 +441,18 @@ int evaluate(const Board& b) {
 
     // 5. Affine 32 → 32.
     int32_t l2[L2_OUT];
-    for (int i = 0; i < L2_OUT; ++i) {
-        int32_t sum = l2_biases_[i];
-        const int8_t* row = &l2_weights_[size_t(i) * L2_IN];
-        for (int j = 0; j < L2_IN; ++j) sum += int32_t(row[j]) * int32_t(l1r[j]);
-        l2[i] = sum;
+#if NNUE_X86
+    if (g_use_avx2) {
+        affine_avx2(l1r, l2_weights_.data(), l2_biases_.data(), l2, L2_IN, L2_OUT);
+    } else
+#endif
+    {
+        for (int i = 0; i < L2_OUT; ++i) {
+            int32_t sum = l2_biases_[i];
+            const int8_t* row = &l2_weights_[size_t(i) * L2_IN];
+            for (int j = 0; j < L2_IN; ++j) sum += int32_t(row[j]) * int32_t(l1r[j]);
+            l2[i] = sum;
+        }
     }
     uint8_t l2r[L2_OUT];
     for (int i = 0; i < L2_OUT; ++i) {
@@ -351,7 +460,8 @@ int evaluate(const Board& b) {
         l2r[i] = uint8_t(v < 0 ? 0 : v > 127 ? 127 : v);
     }
 
-    // 6. Output 32 → 1 (no ReLU on the final layer).
+    // 6. Output 32 → 1 (no ReLU on the final layer). Output layer is small
+    // enough that scalar wins (single output, 32 muls). Skip SIMD here.
     int32_t out = out_biases_[0];
     for (int j = 0; j < LO_IN; ++j)
         out += int32_t(out_weights_[j]) * int32_t(l2r[j]);
