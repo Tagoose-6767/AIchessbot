@@ -12,3 +12,7 @@ selfplay.pgn
 *.exe
 build/
 chess_engine/chess_engine
+
+# NNUE network files (binary, multi-MB; download separately)
+*.nnue
+chess_engine/nets/

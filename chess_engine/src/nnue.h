@@ -1,26 +1,25 @@
-// nnue.h — NNUE-lite (768→256→1) inference infrastructure.
+// nnue.h — Stockfish-12-compatible HalfKP-256x2-32-32 NNUE inference.
+//
+// File format: native Stockfish .nnue (version 0x7AF32F16, ~21 MB).
 //
 // Architecture:
-//   - 768 input features (12 piece types × 64 squares). Each piece on the
-//     board activates one feature.
-//   - 256-dim hidden layer with ReLU.
-//   - 1-dim linear output (centipawns from white's perspective).
+//   - HalfKP feature transformer: 41024 features per perspective × 256 hidden
+//   - Concatenated dual-perspective accumulator → 512 dims
+//   - Affine 512→32 + ClippedReLU
+//   - Affine 32→32  + ClippedReLU
+//   - Affine 32→1
+//   - Final score = output / FV_SCALE (16)
 //
-// File format ("NNUELITE" magic, little-endian, all int16 quantized):
-//   char     magic[8]                 = "NNUELITE"
-//   uint32_t version                  = 1
-//   uint16_t input_dim                = 768
-//   uint16_t hidden_dim               = 256
-//   uint16_t output_dim               = 1
-//   int16_t  output_scale             (divisor for the int32 output)
-//   int16_t  W_input[768 * 256]       (input weights, indexed [feat][hidden])
-//   int16_t  b_hidden[256]
-//   int16_t  W_output[256]
-//   int32_t  b_output
+// Quantization: feature transformer weights/biases int16, hidden layer
+// weights int8 with int32 biases, ClippedReLU shifts by 6 bits before
+// clamping to [0, 127].
 //
-// Without a loaded .nnue file evaluate() falls back to HCE — no regression.
-// You must supply trained weights to actually gain Elo. Random/untrained
-// weights will WEAKEN the engine, so we never auto-initialize them.
+// This is a NON-INCREMENTAL implementation: the accumulator is rebuilt from
+// scratch on every eval call. The reference implementation incrementally
+// updates per move, which is roughly 10× faster but requires hooks in
+// make/unmake. Cost: ~25K mul-adds per eval (scalar), comparable to HCE.
+//
+// If no .nnue file is loaded, evaluate() falls back to HCE — no regression.
 #pragma once
 
 #include "types.h"
