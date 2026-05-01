@@ -22,9 +22,15 @@ static const char* ENGINE_AUTHOR  = "AIChessbot";
 static const char* ENGINE_VERSION = "0.2";
 
 static Board g_board;
-static Searcher g_searcher;
 static OpeningBook g_book;
 static std::thread g_search_thread;
+
+struct EngineOptions {
+    int hash_mb = 256;
+    int threads = 1;
+};
+static EngineOptions g_opts;
+static int g_max_threads = 1;  // populated at startup from hardware_concurrency()
 
 static std::string score_to_uci(int s) {
     if (std::abs(s) >= VALUE_MATE_IN_MAX_PLY) {
@@ -122,8 +128,41 @@ static void uci_go(std::istringstream& iss) {
         }
     }
 
-    g_search_thread = std::thread([lim]() {
-        g_searcher.start(g_board, lim, on_info, on_bestmove);
+    g_search_stop.store(false);
+    int n_threads = g_opts.threads < 1 ? 1 : g_opts.threads;
+    Board root = g_board;  // canonical root copied here before threads diverge
+
+    g_search_thread = std::thread([lim, n_threads, root]() mutable {
+        // Lazy SMP: each thread gets its own Board + Searcher; they all share
+        // the global TT. The main thread (index 0) reports info and bestmove;
+        // helpers run silently. Helpers diverge naturally via TT race effects
+        // and their own killers/history.
+        std::vector<Board> boards;
+        std::vector<std::unique_ptr<Searcher>> searchers;
+        boards.reserve(n_threads);
+        searchers.reserve(n_threads);
+        for (int i = 0; i < n_threads; ++i) {
+            boards.push_back(root);
+            searchers.push_back(std::make_unique<Searcher>());
+        }
+
+        std::vector<std::thread> helpers;
+        helpers.reserve(n_threads - 1);
+        for (int i = 1; i < n_threads; ++i) {
+            helpers.emplace_back([&, i]() {
+                searchers[i]->start(boards[i], lim,
+                                    [](const SearchInfo&) {},   // no info from helpers
+                                    [](Move) {});               // no bestmove from helpers
+            });
+        }
+
+        // Main search.
+        searchers[0]->start(boards[0], lim, on_info, on_bestmove);
+
+        // Stop and join helpers before destroying their boards/searchers.
+        g_search_stop.store(true);
+        for (auto& s : searchers) s->stop();
+        for (auto& t : helpers) if (t.joinable()) t.join();
     });
 }
 
@@ -135,12 +174,16 @@ static void uci_setoption(std::istringstream& iss) {
 
     if (name == "Hash") {
         size_t mb = std::stoul(value);
+        g_opts.hash_mb = int(mb);
         TT.resize(mb);
     } else if (name == "Book") {
         g_book.close();
         if (!value.empty()) g_book.load(value);
     } else if (name == "Threads") {
-        // Single-threaded engine for now; ignore.
+        int n = std::stoi(value);
+        if (n < 1) n = 1;
+        if (n > g_max_threads) n = g_max_threads;
+        g_opts.threads = n;
     }
 }
 
@@ -218,6 +261,8 @@ int main(int argc, char** argv) {
     Zobrist::init();
     init_movegen();
     TT.resize(256);
+    g_max_threads = int(std::thread::hardware_concurrency());
+    if (g_max_threads <= 0) g_max_threads = 1;
     g_board.set("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 
     // CLI: `chess_engine bench [depth]` runs bench and exits.
@@ -238,8 +283,9 @@ int main(int argc, char** argv) {
             std::cout << "id name " << ENGINE_NAME << '\n';
             std::cout << "id author " << ENGINE_AUTHOR << '\n';
             std::cout << "option name Hash type spin default 256 min 1 max 65536\n";
-            std::cout << "option name Threads type spin default 1 min 1 max 1\n";
+            std::cout << "option name Threads type spin default 1 min 1 max " << g_max_threads << "\n";
             std::cout << "option name Book type string default \n";
+            std::cout << "option name EvalFile type string default \n";
             std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             wait_for_search();
@@ -253,12 +299,12 @@ int main(int argc, char** argv) {
         } else if (cmd == "go") {
             uci_go(iss);
         } else if (cmd == "stop") {
-            g_searcher.stop();
+            g_search_stop.store(true);
             wait_for_search();
         } else if (cmd == "setoption") {
             uci_setoption(iss);
         } else if (cmd == "quit") {
-            g_searcher.stop();
+            g_search_stop.store(true);
             wait_for_search();
             break;
         } else if (cmd == "perft") {

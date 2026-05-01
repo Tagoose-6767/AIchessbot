@@ -10,6 +10,8 @@
 #include <cstring>
 #include <iostream>
 
+std::atomic<bool> g_search_stop{false};
+
 namespace {
 constexpr int ASPIRATION_DELTA = 25;
 constexpr int RAZOR_MARGIN[4]  = { 0, 250, 400, 0 };
@@ -22,6 +24,10 @@ inline bool is_mate(int s) { return std::abs(s) >= VALUE_MATE_IN_MAX_PLY; }
 
 bool Searcher::time_up() {
     if (stop_flag_.load(std::memory_order_relaxed)) return true;
+    if (g_search_stop.load(std::memory_order_relaxed)) {
+        stop_flag_.store(true, std::memory_order_relaxed);
+        return true;
+    }
     if (hard_time_limit_ <= 0) return false;
     auto now = std::chrono::steady_clock::now();
     auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_tp_).count();

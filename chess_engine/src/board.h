@@ -16,6 +16,9 @@ struct StateInfo {
 class Board {
 public:
     Board();
+    Board(const Board& other);             // deep copy with state_stack pointer fixup (for Lazy SMP)
+    Board& operator=(const Board& other);
+
     void set(const std::string& fen);
     std::string fen() const;
     void print() const;

@@ -25,6 +25,38 @@ const int CASTLING_MASK[64] = {
 
 Board::Board() { clear(); }
 
+// Deep-copy ctor: copy all bitboards/state, then fix up StateInfo pointers
+// (st and previous chains) so they point into THIS object's state_stack array
+// rather than the source's. Used by Lazy SMP to give each thread its own Board.
+Board::Board(const Board& o) {
+    *this = o;
+}
+
+Board& Board::operator=(const Board& o) {
+    if (this == &o) return *this;
+    for (int i = 0; i < PIECE_TYPE_NB; ++i) byType[i] = o.byType[i];
+    for (int i = 0; i < COLOR_NB; ++i) byColor[i] = o.byColor[i];
+    occupied = o.occupied;
+    for (int i = 0; i < 64; ++i) board[i] = o.board[i];
+    king_square[0] = o.king_square[0];
+    king_square[1] = o.king_square[1];
+    stm = o.stm;
+    game_ply = o.game_ply;
+    for (int i = 0; i < 2048; ++i) history_keys[i] = o.history_keys[i];
+
+    // Copy state stack and rebase pointers.
+    int st_idx = int(o.st - o.state_stack);
+    for (int i = 0; i <= st_idx; ++i) {
+        state_stack[i] = o.state_stack[i];
+        if (o.state_stack[i].previous != nullptr) {
+            intptr_t prev_idx = o.state_stack[i].previous - o.state_stack;
+            state_stack[i].previous = state_stack + prev_idx;
+        }
+    }
+    st = state_stack + st_idx;
+    return *this;
+}
+
 void Board::clear() {
     for (auto& bb : byType) bb = 0;
     for (auto& bb : byColor) bb = 0;

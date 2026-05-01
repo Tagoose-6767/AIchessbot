@@ -16,6 +16,11 @@ struct SearchLimits {
     bool   infinite  = false;
 };
 
+// Global stop flag. UCI "stop" sets it; cleared at the start of every "go".
+// All Searchers check it in addition to their own per-instance stop, so a
+// stop request reaches every helper thread under Lazy SMP.
+extern std::atomic<bool> g_search_stop;
+
 struct SearchInfo {
     int depth, seldepth, score;
     uint64_t nodes;
