@@ -180,30 +180,132 @@ void unload() {
 
 bool is_loaded() { return loaded_; }
 
-// --- Forward pass ------------------------------------------------------------
-int evaluate(const Board& b) {
-    if (!loaded_) return 0;  // caller (evaluate.cpp) checks is_loaded() first
-
-    // 1. Build accumulator per perspective: start with biases, add feature columns.
-    int16_t acc[2][HALF_DIMS];
-    for (int p = 0; p < 2; ++p)
-        std::memcpy(acc[p], ft_biases_.data(), HALF_DIMS * sizeof(int16_t));
-
-    int king_sq[2] = { b.king_sq(WHITE), b.king_sq(BLACK) };
-    int king_oriented[2] = {
-        orient(WHITE, king_sq[WHITE]),
-        orient(BLACK, king_sq[BLACK])
-    };
-
-    // For each non-king piece on the board, add its column for both perspectives.
+// Refresh: build one perspective's accumulator from the position, ignoring any
+// cached state. Used by evaluate() when the incremental chain is broken.
+void refresh_perspective(const Board& b, Color persp, int16_t* acc) {
+    std::memcpy(acc, ft_biases_.data(), HALF_DIMS * sizeof(int16_t));
+    int ksq_oriented = orient(persp, b.king_sq(persp));
     Bitboard pieces = b.pieces() & ~b.pieces(KING);
     while (pieces) {
         int sq = pop_lsb(pieces);
         Piece pc = b.piece_on(sq);
-        for (int p = 0; p < 2; ++p) {
-            uint32_t feat = feature_idx(Color(p), pc, sq, king_oriented[p]);
-            const int16_t* col = &ft_weights_[size_t(feat) * HALF_DIMS];
-            for (int h = 0; h < HALF_DIMS; ++h) acc[p][h] += col[h];
+        uint32_t feat = feature_idx(persp, pc, sq, ksq_oriented);
+        const int16_t* col = &ft_weights_[size_t(feat) * HALF_DIMS];
+        for (int h = 0; h < HALF_DIMS; ++h) acc[h] += col[h];
+    }
+}
+
+// Helper: add or remove a single piece's feature column from one perspective.
+namespace {
+inline void add_feature(int16_t* acc, Color persp, Piece pc, int sq,
+                        int ksq_oriented, int sign) {
+    if (type_of_piece(pc) == KING) return;            // kings excluded
+    uint32_t feat = feature_idx(persp, pc, sq, ksq_oriented);
+    const int16_t* col = &ft_weights_[size_t(feat) * HALF_DIMS];
+    if (sign > 0)
+        for (int h = 0; h < HALF_DIMS; ++h) acc[h] += col[h];
+    else
+        for (int h = 0; h < HALF_DIMS; ++h) acc[h] -= col[h];
+}
+}  // namespace
+
+// Incremental update on make_move. After the move has been applied to the
+// board, deduce the piece changes from the move + the captured piece type,
+// and apply them to a copy of prev's accumulator. King moves on a perspective
+// invalidate that perspective (full refresh deferred to evaluate()).
+void update_after_move(const Board& b,
+                       const StateInfo* prev, StateInfo* curr,
+                       Move m) {
+    if (!loaded_) {
+        curr->nnue_acc_computed[0] = curr->nnue_acc_computed[1] = false;
+        return;
+    }
+    int from = from_sq(m), to = to_sq(m);
+    MoveType mt = type_of_move(m);
+    // After make_move, side-to-move is flipped. The mover is the opposite.
+    Color mover = ~b.side_to_move();
+
+    bool king_moved_mover = (mt == MT_CASTLING)
+                         || (mt == MT_NORMAL && b.type_on(to) == KING);
+
+    for (int p = 0; p < 2; ++p) {
+        Color persp = Color(p);
+
+        if (!prev->nnue_acc_computed[p]) {
+            curr->nnue_acc_computed[p] = false;
+            continue;
+        }
+        // For the perspective whose king moved, lazy-invalidate. evaluate()
+        // will rebuild from scratch the next time we evaluate this position.
+        if (king_moved_mover && persp == mover) {
+            curr->nnue_acc_computed[p] = false;
+            continue;
+        }
+
+        // Apply incremental delta from prev to curr.
+        std::memcpy(curr->nnue_acc[p], prev->nnue_acc[p],
+                    HALF_DIMS * sizeof(int16_t));
+        int ksq_oriented = orient(persp, b.king_sq(persp));
+        int16_t* acc = curr->nnue_acc[p];
+
+        if (mt == MT_NORMAL) {
+            Piece moved = b.piece_on(to);
+            add_feature(acc, persp, moved, from, ksq_oriented, -1);
+            add_feature(acc, persp, moved, to,   ksq_oriented, +1);
+            if (curr->captured != NO_PIECE_TYPE) {
+                Piece cap = make_piece(~mover, PieceType(curr->captured));
+                add_feature(acc, persp, cap, to, ksq_oriented, -1);
+            }
+        } else if (mt == MT_ENPASSANT) {
+            Piece pawn = make_piece(mover, PAWN);
+            add_feature(acc, persp, pawn, from, ksq_oriented, -1);
+            add_feature(acc, persp, pawn, to,   ksq_oriented, +1);
+            int cap_sq = to + (mover == WHITE ? -8 : 8);
+            Piece enemy = make_piece(~mover, PAWN);
+            add_feature(acc, persp, enemy, cap_sq, ksq_oriented, -1);
+        } else if (mt == MT_PROMOTION) {
+            Piece pawn     = make_piece(mover, PAWN);
+            Piece promoted = make_piece(mover, promotion_of(m));
+            add_feature(acc, persp, pawn,     from, ksq_oriented, -1);
+            add_feature(acc, persp, promoted, to,   ksq_oriented, +1);
+            if (curr->captured != NO_PIECE_TYPE) {
+                Piece cap = make_piece(~mover, PieceType(curr->captured));
+                add_feature(acc, persp, cap, to, ksq_oriented, -1);
+            }
+        } else if (mt == MT_CASTLING) {
+            // Mover's king moved → handled via king_moved_mover above (this
+            // branch only runs for the non-mover perspective). The rook moved
+            // too; reflect just the rook for the non-mover perspective.
+            int rook_from, rook_to;
+            if (file_of(to) == 6) {
+                rook_from = mover == WHITE ? 7 : 63;
+                rook_to   = mover == WHITE ? 5 : 61;
+            } else {
+                rook_from = mover == WHITE ? 0 : 56;
+                rook_to   = mover == WHITE ? 3 : 59;
+            }
+            Piece rook = make_piece(mover, ROOK);
+            add_feature(acc, persp, rook, rook_from, ksq_oriented, -1);
+            add_feature(acc, persp, rook, rook_to,   ksq_oriented, +1);
+        }
+
+        curr->nnue_acc_computed[p] = true;
+    }
+}
+
+// --- Forward pass ------------------------------------------------------------
+int evaluate(const Board& b) {
+    if (!loaded_) return 0;
+
+    // 1. Get / refresh the accumulator. The board's current StateInfo holds
+    // the cached state; if either perspective is stale, rebuild it here and
+    // mark valid so subsequent evaluations on the same node are O(1).
+    StateInfo* st_mut = const_cast<StateInfo*>(b.state_info());
+    int16_t (*acc)[HALF_DIMS] = st_mut->nnue_acc;
+    for (int p = 0; p < 2; ++p) {
+        if (!st_mut->nnue_acc_computed[p]) {
+            refresh_perspective(b, Color(p), acc[p]);
+            st_mut->nnue_acc_computed[p] = true;
         }
     }
 

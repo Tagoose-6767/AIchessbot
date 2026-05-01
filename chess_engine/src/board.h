@@ -11,6 +11,16 @@ struct StateInfo {
     int captured;         // PieceType captured by the move that produced this state
     U64 key;
     StateInfo* previous;
+
+    // --- NNUE incremental accumulator -------------------------------------
+    // One 256-dim int16 vector per perspective (white, black). Updated in
+    // make_move from the previous StateInfo's accumulator; popped automatically
+    // by unmake_move when it pops the state stack. The `computed` flags let
+    // evaluate() lazily refresh from scratch when the chain is broken (e.g.,
+    // freshly-set position, freshly-loaded net, or a king move that we mark
+    // invalid for the moving side instead of refreshing eagerly).
+    alignas(32) int16_t nnue_acc[2][256];
+    bool    nnue_acc_computed[2];
 };
 
 class Board {
@@ -40,6 +50,9 @@ public:
     int king_sq(Color c) const           { return king_square[c]; }
     int game_ply_count() const           { return game_ply; }
     int non_pawn_material(Color c) const;
+
+    // Exposed so NNUE can read/refresh the per-position accumulator cache.
+    StateInfo* state_info() const        { return st; }
 
     // --- Move handling --------------------------------------------------------
     void make_move(Move m);

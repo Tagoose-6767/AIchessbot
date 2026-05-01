@@ -26,10 +26,22 @@
 #include <string>
 
 class Board;
+struct StateInfo;
 
 namespace NNUE {
     bool load(const std::string& path);
     void unload();
     bool is_loaded();
     int  evaluate(const Board& b);  // centipawns from side-to-move's perspective
+
+    // Refresh one perspective's accumulator from scratch (full feature scan).
+    void refresh_perspective(const Board& b, Color persp, int16_t* acc);
+
+    // Forward incremental update: starting from prev's accumulator, produce
+    // curr's accumulator after the move `m` was played. King moves on a
+    // perspective leave that perspective's nnue_acc_computed=false and let
+    // evaluate() lazy-refresh on demand.
+    void update_after_move(const Board& b,
+                           const StateInfo* prev, StateInfo* curr,
+                           Move m);
 }

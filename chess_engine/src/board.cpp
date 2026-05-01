@@ -3,6 +3,7 @@
 #include "board.h"
 #include "movegen.h"
 #include "tt.h"
+#include "nnue.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -72,6 +73,8 @@ void Board::clear() {
     st->captured = NO_PIECE_TYPE;
     st->key = 0;
     st->previous = nullptr;
+    st->nnue_acc_computed[0] = false;
+    st->nnue_acc_computed[1] = false;
 }
 
 void Board::put_piece(Piece p, int sq) {
@@ -342,10 +345,15 @@ void Board::make_move(Move m) {
 
     StateInfo* prev = st;
     ++st;
-    *st = *prev;
-    st->previous = prev;
-    st->captured = NO_PIECE_TYPE;
-    st->halfmove_clock++;
+    // Copy ONLY the inherited scalar fields. The 1 KB nnue_acc is filled in
+    // by NNUE::update_after_move below, or left invalid if NNUE is loaded
+    // and a king moved (cheaper than copying then overwriting).
+    st->castling_rights = prev->castling_rights;
+    st->ep_square       = prev->ep_square;
+    st->halfmove_clock  = prev->halfmove_clock + 1;
+    st->key             = prev->key;
+    st->previous        = prev;
+    st->captured        = NO_PIECE_TYPE;
 
     // Clear ep from key (re-add only if a new double push happens this move).
     if (st->ep_square != SQ_NONE) {
@@ -405,6 +413,9 @@ void Board::make_move(Move m) {
     stm = ~stm;
     history_keys[++game_ply] = st->key;
     (void)moved_pt;
+
+    // NNUE incremental accumulator update. No-op when NNUE isn't loaded.
+    NNUE::update_after_move(*this, st->previous, st, m);
 }
 
 void Board::unmake_move(Move m) {
@@ -491,10 +502,12 @@ void Board::unmake_move(Move m) {
 void Board::make_null_move() {
     StateInfo* prev = st;
     ++st;
-    *st = *prev;
-    st->previous = prev;
-    st->captured = NO_PIECE_TYPE;
-    st->halfmove_clock++;
+    st->castling_rights = prev->castling_rights;
+    st->ep_square       = prev->ep_square;
+    st->halfmove_clock  = prev->halfmove_clock + 1;
+    st->key             = prev->key;
+    st->previous        = prev;
+    st->captured        = NO_PIECE_TYPE;
     if (st->ep_square != SQ_NONE) {
         st->key ^= Zobrist::ep_file[file_of(st->ep_square)];
         st->ep_square = SQ_NONE;
@@ -502,6 +515,15 @@ void Board::make_null_move() {
     st->key ^= Zobrist::side;
     stm = ~stm;
     history_keys[++game_ply] = st->key;
+    // Null move: position is unchanged except side-to-move. Inherit accumulator.
+    if (prev->nnue_acc_computed[0] && prev->nnue_acc_computed[1]) {
+        std::memcpy(st->nnue_acc, prev->nnue_acc, sizeof(st->nnue_acc));
+        st->nnue_acc_computed[0] = true;
+        st->nnue_acc_computed[1] = true;
+    } else {
+        st->nnue_acc_computed[0] = false;
+        st->nnue_acc_computed[1] = false;
+    }
 }
 
 void Board::unmake_null_move() {
