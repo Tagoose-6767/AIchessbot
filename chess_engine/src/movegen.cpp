@@ -199,18 +199,13 @@ static void gen_pawn_moves(const Board& b, MoveList& ml, bool only_caps) {
     Bitboard their_pieces = b.pieces(them);
 
     int up    = us == WHITE ? 8 : -8;
-    Bitboard rank3 = us == WHITE ? RANK_4_BB >> 8 : RANK_5_BB << 8;  // rank3 from white perspective
-    // Let's redo: doubled push squares require single push to land on rank3 (white) / rank6 (black).
     Bitboard pre_promotion = us == WHITE ? RANK_7_BB : RANK_2_BB;
+    Bitboard non_promo = pawns & ~pre_promotion;
+    Bitboard promo     = pawns & pre_promotion;
 
-    // Pushes (only when not in capture-only mode)
+    // Quiet pushes (skipped in capture-only mode).
     if (!only_caps) {
-        Bitboard non_promo = pawns & ~pre_promotion;
-        Bitboard promo     = pawns & pre_promotion;
-
         Bitboard single = (us == WHITE ? non_promo << 8 : non_promo >> 8) & empty;
-        Bitboard dbl_src = (us == WHITE ? (single & RANK_4_BB >> 8) : (single & RANK_5_BB << 8));
-        // dbl pushes only from rank 2 (white) / rank 7 (black). Source pawn must be on rank2/7.
         Bitboard r2_pawns = pawns & (us == WHITE ? RANK_2_BB : RANK_7_BB);
         Bitboard one_step = (us == WHITE ? r2_pawns << 8 : r2_pawns >> 8) & empty;
         Bitboard two_step = (us == WHITE ? one_step << 8 : one_step >> 8) & empty;
@@ -226,18 +221,18 @@ static void gen_pawn_moves(const Board& b, MoveList& ml, bool only_caps) {
             int from = to - 2 * up;
             ml.push(make_normal(from, to));
         }
-        // Promotion pushes
-        Bitboard promo_push = (us == WHITE ? promo << 8 : promo >> 8) & empty;
-        while (promo_push) {
-            int to = pop_lsb(promo_push);
-            int from = to - up;
-            emit_promos(ml, from, to);
-        }
     }
 
-    // Captures
-    Bitboard non_promo = pawns & ~pre_promotion;
-    Bitboard promo     = pawns & pre_promotion;
+    // Promotion pushes are TACTICAL — emit them even in only_caps mode so the
+    // staged picker / qsearch see them alongside captures.
+    Bitboard promo_push = (us == WHITE ? promo << 8 : promo >> 8) & empty;
+    while (promo_push) {
+        int to = pop_lsb(promo_push);
+        int from = to - up;
+        emit_promos(ml, from, to);
+    }
+
+    // Captures (always)
     int up_l = us == WHITE ? 7 : -9;  // up-left
     int up_r = us == WHITE ? 9 : -7;  // up-right
     Bitboard left_caps  = (us == WHITE ? (non_promo & ~FILE_A_BB) << 7 : (non_promo & ~FILE_A_BB) >> 9) & their_pieces;
@@ -352,6 +347,29 @@ void generate_captures(const Board& b, MoveList& list) {
     gen_piece_moves(b, list, KING,   target);
 }
 
+// Quiet moves only (no captures, no promotions). Used by MovePicker so it
+// doesn't re-generate captures it already produced.
+void generate_quiets(const Board& b, MoveList& list) {
+    Color us = b.side_to_move();
+    Bitboard empty = ~b.pieces();
+    Bitboard pawns = b.pieces(us, PAWN);
+    Bitboard pre_promotion = us == WHITE ? RANK_7_BB : RANK_2_BB;
+    Bitboard non_promo = pawns & ~pre_promotion;
+    int up = us == WHITE ? 8 : -8;
+    Bitboard single = (us == WHITE ? non_promo << 8 : non_promo >> 8) & empty;
+    Bitboard r2_pawns = pawns & (us == WHITE ? RANK_2_BB : RANK_7_BB);
+    Bitboard one_step = (us == WHITE ? r2_pawns << 8 : r2_pawns >> 8) & empty;
+    Bitboard two_step = (us == WHITE ? one_step << 8 : one_step >> 8) & empty;
+    while (single)   { int to = pop_lsb(single);   list.push(make_normal(to - up,     to)); }
+    while (two_step) { int to = pop_lsb(two_step); list.push(make_normal(to - 2 * up, to)); }
+    gen_piece_moves(b, list, KNIGHT, empty);
+    gen_piece_moves(b, list, BISHOP, empty);
+    gen_piece_moves(b, list, ROOK,   empty);
+    gen_piece_moves(b, list, QUEEN,  empty);
+    gen_piece_moves(b, list, KING,   empty);
+    gen_castling(b, list);
+}
+
 void generate_legal(const Board& b, MoveList& list) {
     MoveList pseudo;
     generate_pseudo(b, pseudo);
@@ -370,42 +388,139 @@ void generate_legal(const Board& b, MoveList& list) {
 }
 
 // ---------------------------------------------------------------------------
-// Move ordering
+// MovePicker — staged move generation
 // ---------------------------------------------------------------------------
-// MVV-LVA: capturing high-value piece with low-value piece scores best.
-static int mvv_lva(PieceType victim, PieceType attacker) {
-    return PieceValueSimple[victim] * 16 - int(attacker);
+MovePicker::MovePicker(const Board& b,
+                       Move tt_move,
+                       const Move* killers,
+                       int (*history)[64])
+    : b_(&b),
+      tt_move_(tt_move),
+      killer1_(killers[0]),
+      killer2_(killers[1]),
+      history_(history) {}
+
+void MovePicker::generate_and_classify_caps() {
+    generate_captures(*b_, caps_);
+    // Score MVV-LVA, then partition by SEE: good (>0) | equal (=0) | bad (<0).
+    for (int i = 0; i < caps_.size; i++) {
+        Move m = caps_.moves[i].move;
+        PieceType victim = (type_of_move(m) == MT_ENPASSANT) ? PAWN : b_->type_on(to_sq(m));
+        PieceType attacker = b_->type_on(from_sq(m));
+        int s = PieceValueSimple[victim] * 16 - int(attacker);
+        if (type_of_move(m) == MT_PROMOTION) s += PieceValueSimple[promotion_of(m)];
+        caps_.moves[i].score = s;
+    }
+    std::sort(caps_.moves, caps_.moves + caps_.size,
+              [](const ExtMove& a, const ExtMove& b) { return a.score > b.score; });
+
+    // Three-way partition into good / equal / bad while preserving MVV-LVA order.
+    Move good[MAX_MOVES], equal[MAX_MOVES], bad[MAX_MOVES];
+    int n_good = 0, n_eq = 0, n_bad = 0;
+    for (int i = 0; i < caps_.size; i++) {
+        Move m = caps_.moves[i].move;
+        if (b_->see_ge(m, 1))      good[n_good++]  = m;
+        else if (b_->see_ge(m, 0)) equal[n_eq++]   = m;
+        else                       bad[n_bad++]    = m;
+    }
+    int idx = 0;
+    for (int i = 0; i < n_good; i++) caps_.moves[idx++] = { good[i],  0 };
+    caps_eq_start_ = idx;
+    for (int i = 0; i < n_eq;   i++) caps_.moves[idx++] = { equal[i], 0 };
+    caps_bad_start_ = idx;
+    for (int i = 0; i < n_bad;  i++) caps_.moves[idx++] = { bad[i],   0 };
+    caps_.size = idx;
+    caps_idx_ = 0;
 }
 
-void score_moves(const Board& b, MoveList& list,
-                 Move tt_move,
-                 const Move* killers,
-                 const int (*history)[64],
-                 Move counter) {
-    for (int i = 0; i < list.size; i++) {
-        Move m = list.moves[i].move;
-        if (m == tt_move) { list.moves[i].score = 1 << 30; continue; }
+void MovePicker::generate_and_score_quiets() {
+    MoveList all;
+    generate_quiets(*b_, all);
+    quiets_.size = 0;
+    for (int i = 0; i < all.size; i++) {
+        Move m = all.moves[i].move;
+        if (m == tt_move_ || m == killer1_ || m == killer2_) continue;
+        Piece p = b_->piece_on(from_sq(m));
+        quiets_.moves[quiets_.size++] = { m, history_[p][to_sq(m)] };
+    }
+    std::sort(quiets_.moves, quiets_.moves + quiets_.size,
+              [](const ExtMove& a, const ExtMove& b) { return a.score > b.score; });
+    quiets_idx_ = 0;
+}
 
-        bool cap = b.is_capture(m);
-        if (cap) {
-            PieceType victim = (type_of_move(m) == MT_ENPASSANT) ? PAWN : b.type_on(to_sq(m));
-            PieceType attacker = b.type_on(from_sq(m));
-            int s = 1 << 22;
-            s += mvv_lva(victim, attacker);
-            if (!b.see_ge(m, 0)) s -= (1 << 22) - (1 << 19);  // bad capture: demote below quiets
-            list.moves[i].score = s;
-            continue;
-        }
-        if (type_of_move(m) == MT_PROMOTION) {
-            list.moves[i].score = (1 << 24) + int(promotion_of(m));
-            continue;
-        }
-        if (m == killers[0]) { list.moves[i].score = (1 << 21); continue; }
-        if (m == killers[1]) { list.moves[i].score = (1 << 21) - 1; continue; }
-        if (m == counter)    { list.moves[i].score = (1 << 20); continue; }
+Move MovePicker::next() {
+    while (true) {
+        switch (stage_) {
+            case ST_TT:
+                stage_ = ST_GEN_CAPS;
+                if (tt_move_ != MOVE_NONE && b_->is_pseudo_legal(tt_move_))
+                    return tt_move_;
+                continue;
 
-        Piece p = b.piece_on(from_sq(m));
-        list.moves[i].score = history[p][to_sq(m)];
+            case ST_GEN_CAPS:
+                generate_and_classify_caps();
+                stage_ = ST_GOOD_CAPS;
+                continue;
+
+            case ST_GOOD_CAPS:
+                while (caps_idx_ < caps_eq_start_) {
+                    Move m = caps_.moves[caps_idx_++].move;
+                    if (m == tt_move_) continue;
+                    return m;
+                }
+                stage_ = ST_KILLER1;
+                continue;
+
+            case ST_KILLER1:
+                stage_ = ST_KILLER2;
+                if (killer1_ != MOVE_NONE && killer1_ != tt_move_
+                    && !b_->is_capture(killer1_)
+                    && type_of_move(killer1_) != MT_PROMOTION
+                    && b_->is_pseudo_legal(killer1_))
+                    return killer1_;
+                continue;
+
+            case ST_KILLER2:
+                stage_ = ST_EQUAL_CAPS;
+                if (killer2_ != MOVE_NONE && killer2_ != tt_move_ && killer2_ != killer1_
+                    && !b_->is_capture(killer2_)
+                    && type_of_move(killer2_) != MT_PROMOTION
+                    && b_->is_pseudo_legal(killer2_))
+                    return killer2_;
+                continue;
+
+            case ST_EQUAL_CAPS:
+                while (caps_idx_ < caps_bad_start_) {
+                    Move m = caps_.moves[caps_idx_++].move;
+                    if (m == tt_move_) continue;
+                    return m;
+                }
+                stage_ = ST_GEN_QUIETS;
+                continue;
+
+            case ST_GEN_QUIETS:
+                generate_and_score_quiets();
+                stage_ = ST_QUIETS;
+                continue;
+
+            case ST_QUIETS:
+                if (quiets_idx_ < quiets_.size)
+                    return quiets_.moves[quiets_idx_++].move;
+                stage_ = ST_BAD_CAPS;
+                continue;
+
+            case ST_BAD_CAPS:
+                while (caps_idx_ < caps_.size) {
+                    Move m = caps_.moves[caps_idx_++].move;
+                    if (m == tt_move_) continue;
+                    return m;
+                }
+                stage_ = ST_DONE;
+                return MOVE_NONE;
+
+            case ST_DONE:
+                return MOVE_NONE;
+        }
     }
 }
 

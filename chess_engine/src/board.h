@@ -50,6 +50,9 @@ public:
     bool gives_check(Move m) const;
     bool is_legal(Move m) const;
     bool is_capture(Move m) const;
+    // Cheap static check: would generate_pseudo emit this move from this position?
+    // Used to validate TT / killer / counter moves before make_move.
+    bool is_pseudo_legal(Move m) const;
     bool is_capture_or_promotion(Move m) const;
     bool is_repetition() const;
     bool is_50move_draw() const          { return st->halfmove_clock >= 100; }

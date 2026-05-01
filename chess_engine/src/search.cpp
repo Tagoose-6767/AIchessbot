@@ -169,20 +169,8 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
         }
     }
 
-    // --- Move generation & ordering ---
-    MoveList ml;
-    generate_pseudo(b, ml);
-
-    // Find previous move for countermove indexing.
-    Piece prev_piece = NO_PIECE;
-    int  prev_to    = SQ_NONE;
-    // We only have access through the board's last move via search stack — we
-    // don't keep a full stack here, so just disable countermove for now if we
-    // don't have it; the table is keyed on prev_piece/to so MOVE_NONE result
-    // is safe.
-    Move counter = MOVE_NONE;
-
-    score_moves(b, ml, tt_move, killers_[ply], history_, counter);
+    // --- Staged move generation ---
+    MovePicker mp(b, tt_move, killers_[ply], history_);
 
     // Frontier futility precondition.
     bool do_futility = (!in_check && !is_pv && depth <= 4
@@ -195,9 +183,8 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
     int moves_searched = 0;
     int legal_count = 0;
 
-    for (int i = 0; i < ml.size; i++) {
-        ExtMove& em = pick_next(ml, i);
-        Move m = em.move;
+    Move m;
+    while ((m = mp.next()) != MOVE_NONE) {
         bool is_cap = b.is_capture(m);
         bool is_promo = type_of_move(m) == MT_PROMOTION;
         bool gives_chk = b.gives_check(m);

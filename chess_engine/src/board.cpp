@@ -232,6 +232,71 @@ bool Board::gives_check(Move m) const {
 bool Board::is_capture(Move m) const {
     return board[to_sq(m)] != NO_PIECE || type_of_move(m) == MT_ENPASSANT;
 }
+
+bool Board::is_pseudo_legal(Move m) const {
+    if (m == MOVE_NONE) return false;
+    int from = from_sq(m), to = to_sq(m);
+    if (from == to) return false;
+    Piece p = board[from];
+    if (p == NO_PIECE || color_of(p) != stm) return false;
+    PieceType pt = type_of_piece(p);
+    Piece target = board[to];
+    if (target != NO_PIECE && color_of(target) == stm) return false;
+
+    MoveType mt = type_of_move(m);
+
+    if (mt == MT_CASTLING) {
+        // Rare; verify by full pseudo-legal generation.
+        if (pt != KING) return false;
+        MoveList ml;
+        generate_pseudo(*this, ml);
+        for (int i = 0; i < ml.size; i++)
+            if (ml.moves[i].move == m) return true;
+        return false;
+    }
+    if (mt == MT_ENPASSANT) {
+        if (pt != PAWN) return false;
+        if (st->ep_square != to) return false;
+        if (target != NO_PIECE) return false;
+        return (pawn_attacks_bb(stm, from) & sq_bb(to)) != 0;
+    }
+    if (mt == MT_PROMOTION) {
+        if (pt != PAWN) return false;
+        int rank_to = rank_of(to), rank_from = rank_of(from);
+        int up = stm == WHITE ? 8 : -8;
+        if (stm == WHITE && (rank_to != 7 || rank_from != 6)) return false;
+        if (stm == BLACK && (rank_to != 0 || rank_from != 1)) return false;
+        if (to == from + up) return target == NO_PIECE;
+        return target != NO_PIECE && (pawn_attacks_bb(stm, from) & sq_bb(to)) != 0;
+    }
+
+    // Normal move.
+    switch (pt) {
+        case PAWN: {
+            int up = stm == WHITE ? 8 : -8;
+            int rank_from = rank_of(from), rank_to = rank_of(to);
+            // Promotions must use MT_PROMOTION; reject if pawn lands on last rank.
+            if (stm == WHITE && rank_to == 7) return false;
+            if (stm == BLACK && rank_to == 0) return false;
+            if (to == from + up) return target == NO_PIECE;
+            if ((stm == WHITE && rank_from == 1 && to == from + 16
+                 && board[from + 8] == NO_PIECE && target == NO_PIECE)
+             || (stm == BLACK && rank_from == 6 && to == from - 16
+                 && board[from - 8] == NO_PIECE && target == NO_PIECE))
+                return true;
+            if (target != NO_PIECE && color_of(target) != stm
+                && (pawn_attacks_bb(stm, from) & sq_bb(to)))
+                return true;
+            return false;
+        }
+        case KNIGHT: return (knight_attacks_bb(from)            & sq_bb(to)) != 0;
+        case BISHOP: return (bishop_attacks(from, occupied)     & sq_bb(to)) != 0;
+        case ROOK:   return (rook_attacks(from, occupied)       & sq_bb(to)) != 0;
+        case QUEEN:  return (queen_attacks(from, occupied)      & sq_bb(to)) != 0;
+        case KING:   return (king_attacks_bb(from)              & sq_bb(to)) != 0;
+        default: return false;
+    }
+}
 bool Board::is_capture_or_promotion(Move m) const {
     return is_capture(m) || type_of_move(m) == MT_PROMOTION;
 }
