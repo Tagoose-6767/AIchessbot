@@ -39,6 +39,19 @@ struct EvalWeights {
     int bishop_pair_mg;
     int bishop_pair_eg;
     int tempo;
+    // --- Section 3 additions (no NNUE; HCE-only) ---
+    // Per Chebyshev-step that any of my N/B/R/Q is closer than 7 to the
+    // enemy king. Sum over my minor+major pieces.
+    int king_tropism_mg;
+    int king_tropism_eg;
+    // Two same-color rooks on the same file or rank with no own/opponent
+    // pieces strictly between them.
+    int connected_rooks_mg;
+    int connected_rooks_eg;
+    // Bishop attacks at least 5 squares of the a1-h8 / a8-h1 long
+    // diagonals (saturated; outpost-style "controls a long diagonal").
+    int bishop_long_diag_mg;
+    int bishop_long_diag_eg;
 };
 
 extern EvalWeights g_eval;

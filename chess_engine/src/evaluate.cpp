@@ -166,6 +166,17 @@ constexpr int LIT_BISHOP_PAIR_MG = 32;
 constexpr int LIT_BISHOP_PAIR_EG = 54;
 constexpr int LIT_TEMPO = 21;
 
+// Section 3 additions. Hand-set defaults; the Texel pipeline doesn't tune
+// these yet so they keep these literals. With NNUE loaded these have no
+// effect (evaluate() short-circuits to NNUE::evaluate()); they only affect
+// the HCE fallback (`setoption name EvalFile value <none>`) and the tuner.
+constexpr int LIT_KING_TROPISM_MG     = 2;
+constexpr int LIT_KING_TROPISM_EG     = 1;
+constexpr int LIT_CONNECTED_ROOKS_MG  = 14;
+constexpr int LIT_CONNECTED_ROOKS_EG  = 8;
+constexpr int LIT_BISHOP_LONG_DIAG_MG = 12;
+constexpr int LIT_BISHOP_LONG_DIAG_EG = 6;
+
 // === TEXEL-TUNED-WEIGHTS-END ===
 
 // Phase weight per piece type. Sums to 24 in the starting position; we use it
@@ -278,6 +289,74 @@ int king_safety_term(const Board& b, Color us) {
     return score;
 }
 
+// Sum of (7 - chebyshev distance) over my N/B/R/Q to enemy king. Encourages
+// piece placement near the enemy monarch -- the classic "tropism" term used in
+// older HCE engines as a proxy for attacking potential.
+int king_tropism_term(const Board& b, Color us, bool eg) {
+    int ek = b.king_sq(~us);
+    int ek_f = file_of(ek), ek_r = rank_of(ek);
+    int sum = 0;
+    Bitboard pieces = b.pieces(us, KNIGHT) | b.pieces(us, BISHOP)
+                    | b.pieces(us, ROOK)   | b.pieces(us, QUEEN);
+    while (pieces) {
+        int sq = pop_lsb(pieces);
+        int d = std::max(std::abs(file_of(sq) - ek_f),
+                         std::abs(rank_of(sq) - ek_r));
+        if (d < 7) sum += 7 - d;
+    }
+    return sum * (eg ? g_eval.king_tropism_eg : g_eval.king_tropism_mg);
+}
+
+// Two same-color rooks on the same file or rank with no pieces strictly
+// between them. Connected rooks are notoriously powerful (back-rank and 7th-
+// rank batteries); a flat per-pair bonus is the standard HCE shorthand.
+int connected_rooks_term(const Board& b, Color us, bool eg) {
+    Bitboard rooks = b.pieces(us, ROOK);
+    if (popcount(rooks) < 2) return 0;
+    Bitboard occ = b.pieces();
+    int score = 0;
+    int per = eg ? g_eval.connected_rooks_eg : g_eval.connected_rooks_mg;
+    // Iterate all pairs (cheap: at most 2 rooks usually, occasionally 3 with
+    // promotion). Inner check is "no pieces strictly between on shared line".
+    int squares[8]; int n = 0;
+    Bitboard tmp = rooks;
+    while (tmp && n < 8) squares[n++] = pop_lsb(tmp);
+    for (int i = 0; i < n; ++i) for (int j = i + 1; j < n; ++j) {
+        int s1 = squares[i], s2 = squares[j];
+        Bitboard between = 0;
+        if (file_of(s1) == file_of(s2)) {
+            int lo = std::min(s1, s2), hi = std::max(s1, s2);
+            for (int s = lo + 8; s < hi; s += 8) between |= sq_bb(s);
+        } else if (rank_of(s1) == rank_of(s2)) {
+            int lo = std::min(s1, s2), hi = std::max(s1, s2);
+            for (int s = lo + 1; s < hi; ++s)  between |= sq_bb(s);
+        } else {
+            continue;
+        }
+        if (!(between & occ)) score += per;
+    }
+    return score;
+}
+
+// Bishop "controls" a long diagonal if it attacks at least 5 of the 16
+// squares on a1-h8 / a8-h1 (counts both diagonals at once). A fianchettoed
+// bishop with an empty long diagonal fits this naturally.
+int bishop_long_diag_term(const Board& b, Color us, bool eg) {
+    constexpr Bitboard LONG_DIAG_A1H8 = 0x8040201008040201ULL;
+    constexpr Bitboard LONG_DIAG_A8H1 = 0x0102040810204080ULL;
+    Bitboard long_diags = LONG_DIAG_A1H8 | LONG_DIAG_A8H1;
+    Bitboard bishops = b.pieces(us, BISHOP);
+    Bitboard occ = b.pieces();
+    int score = 0;
+    int per = eg ? g_eval.bishop_long_diag_eg : g_eval.bishop_long_diag_mg;
+    while (bishops) {
+        int sq = pop_lsb(bishops);
+        Bitboard atts = bishop_attacks(sq, occ);
+        if (popcount(atts & long_diags) >= 5) score += per;
+    }
+    return score;
+}
+
 int mobility_term(const Board& b, Color us, bool eg) {
     Bitboard occ = b.pieces();
     Bitboard us_bb = b.pieces(us);
@@ -352,6 +431,12 @@ void evaluate_reload_weights() {
     g_eval.bishop_pair_mg = LIT_BISHOP_PAIR_MG;
     g_eval.bishop_pair_eg = LIT_BISHOP_PAIR_EG;
     g_eval.tempo = LIT_TEMPO;
+    g_eval.king_tropism_mg     = LIT_KING_TROPISM_MG;
+    g_eval.king_tropism_eg     = LIT_KING_TROPISM_EG;
+    g_eval.connected_rooks_mg  = LIT_CONNECTED_ROOKS_MG;
+    g_eval.connected_rooks_eg  = LIT_CONNECTED_ROOKS_EG;
+    g_eval.bishop_long_diag_mg = LIT_BISHOP_LONG_DIAG_MG;
+    g_eval.bishop_long_diag_eg = LIT_BISHOP_LONG_DIAG_EG;
 }
 
 namespace {
@@ -388,6 +473,12 @@ int evaluate_hce(const Board& b) {
         mg[c] += king_safety_term(b, col);  // mg only
         mg[c] += mobility_term(b, col, false);
         eg[c] += mobility_term(b, col, true);
+        mg[c] += king_tropism_term(b, col, false);
+        eg[c] += king_tropism_term(b, col, true);
+        mg[c] += connected_rooks_term(b, col, false);
+        eg[c] += connected_rooks_term(b, col, true);
+        mg[c] += bishop_long_diag_term(b, col, false);
+        eg[c] += bishop_long_diag_term(b, col, true);
     }
 
     int mg_score = mg[WHITE] - mg[BLACK];
