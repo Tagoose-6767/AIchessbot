@@ -66,7 +66,11 @@ void clear_shared_history() {
 }
 
 namespace {
-constexpr int ASPIRATION_DELTA = 25;
+// Aspiration: start with a tight 10 cp window and widen progressively (the
+// existing fail-low/fail-high paths double `delta` per re-search). Tighter
+// initial windows produce more cutoffs on the common case where the score is
+// near the previous iteration's; wider widening absorbs the occasional shock.
+constexpr int ASPIRATION_DELTA = 10;
 constexpr int RAZOR_MARGIN[4]  = { 0, 250, 400, 0 };
 constexpr int FUT_MARGIN[5]    = { 0, 150, 300, 450, 0 };
 constexpr int LMR_MIN_DEPTH    = 3;
@@ -168,7 +172,8 @@ int Searcher::quiescence(Board& b, int ply, int alpha, int beta) {
 // ---------------------------------------------------------------------------
 // Negamax with all the trimmings.
 // ---------------------------------------------------------------------------
-int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool allow_null) {
+int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool allow_null,
+                      Move excluded_move) {
     pv_len_[ply] = 0;
     if ((nodes_ & 2047) == 0 && time_up()) return 0;
     if (ply >= MAX_PLY - 1) return evaluate(b);
@@ -190,15 +195,21 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
 
     bool is_pv = beta - alpha > 1;
 
-    // --- TT probe ----
-    bool tt_hit;
-    TTEntry* tte = TT.probe(b.key(), tt_hit);
-    Move tt_move = tt_hit ? tte->move : MOVE_NONE;
-    if (tt_hit && !is_pv && ply > 0 && tte->depth >= depth) {
-        int s = score_from_tt(tte->score, ply);
-        if (tte->bound == BOUND_EXACT) return s;
-        if (tte->bound == BOUND_LOWER && s >= beta)  return s;
-        if (tte->bound == BOUND_UPPER && s <= alpha) return s;
+    // --- TT probe (skipped during a singular-extension verification search,
+    //     since otherwise the same TT entry that triggered SE would let us
+    //     immediately return its bound and the verification would be a no-op).
+    bool tt_hit = false;
+    TTEntry* tte = nullptr;
+    Move tt_move = MOVE_NONE;
+    if (excluded_move == MOVE_NONE) {
+        tte = TT.probe(b.key(), tt_hit);
+        tt_move = tt_hit ? tte->move : MOVE_NONE;
+        if (tt_hit && !is_pv && ply > 0 && tte->depth >= depth) {
+            int s = score_from_tt(tte->score, ply);
+            if (tte->bound == BOUND_EXACT) return s;
+            if (tte->bound == BOUND_LOWER && s >= beta)  return s;
+            if (tte->bound == BOUND_UPPER && s <= alpha) return s;
+        }
     }
 
     // --- Syzygy WDL probe ----
@@ -245,6 +256,33 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
         }
     }
 
+    // --- Multi-cut pruning ----------------------------------------------------
+    // At a non-PV node where beta is achievable (no mate score), try the first
+    // few moves at a reduced depth. If at least 3 of them produce a score >=
+    // beta, the position is so cut-friendly that we can return beta without
+    // searching every move at full depth. Disabled inside the singular
+    // verification search (excluded_move != MOVE_NONE) to avoid double pruning.
+    if (excluded_move == MOVE_NONE && !is_pv && !in_check
+        && depth >= 8 && std::abs(beta) < VALUE_MATE_IN_MAX_PLY) {
+        MovePicker mp_mc(b, tt_move, killers_[ply], g_history);
+        int mc_seen = 0, mc_cuts = 0;
+        Move mm;
+        while (mc_seen < 6 && (mm = mp_mc.next()) != MOVE_NONE) {
+            b.make_move(mm);
+            Color mover = ~b.side_to_move();
+            if (b.attackers_to(b.king_sq(mover), b.pieces()) & b.pieces(b.side_to_move())) {
+                b.unmake_move(mm); continue;
+            }
+            ++mc_seen;
+            int v = -negamax(b, depth - 4, ply + 1, -beta, -beta + 1, true);
+            b.unmake_move(mm);
+            if (stop_flag_.load(std::memory_order_relaxed)) return 0;
+            if (v >= beta) {
+                if (++mc_cuts >= 3) return beta;
+            }
+        }
+    }
+
     // --- Staged move generation ---
     MovePicker mp(b, tt_move, killers_[ply], g_history);
 
@@ -261,12 +299,41 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
 
     Move m;
     while ((m = mp.next()) != MOVE_NONE) {
+        // Singular-extension verification search excludes one move at this
+        // node; skip it here so the surrounding context is measured without it.
+        if (m == excluded_move) continue;
+
         bool is_cap = b.is_capture(m);
         bool is_promo = type_of_move(m) == MT_PROMOTION;
         bool gives_chk = b.gives_check(m);
         bool is_quiet = !is_cap && !is_promo && !gives_chk;
 
         if (do_futility && is_quiet && moves_searched > 0) continue;
+
+        // --- Singular extension --------------------------------------------
+        // If the TT move at this node has a lower-bound (or exact) score from
+        // a sufficiently deep prior search, do a verification search at half
+        // depth with a window just below the TT score, excluding this move.
+        // If no other move can reach singular_beta, the TT move is "singular"
+        // (only one good reply) and we extend its search by one ply.
+        int extension = 0;
+        if (excluded_move == MOVE_NONE
+            && depth >= 8
+            && ply > 0
+            && m == tt_move
+            && tt_hit
+            && tte->depth >= depth - 3
+            && tte->bound != BOUND_UPPER
+            && std::abs(tte->score) < VALUE_MATE_IN_MAX_PLY) {
+            int singular_beta  = score_from_tt(tte->score, ply) - depth;
+            int singular_depth = depth / 2 - 1;
+            if (singular_beta > -VALUE_MATE_IN_MAX_PLY && singular_depth > 0) {
+                int v = negamax(b, singular_depth, ply,
+                                singular_beta - 1, singular_beta, false, /*excluded*/ m);
+                if (stop_flag_.load(std::memory_order_relaxed)) return 0;
+                if (v < singular_beta) extension = 1;
+            }
+        }
 
         b.make_move(m);
         // Legality check (we used pseudo-legal generation).
@@ -277,11 +344,12 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
         }
         ++legal_count;
 
-        int new_depth = depth - 1;
+        int new_depth = depth - 1 + extension;
 
-        // LMR: trust ordering for late, quiet, non-checking moves.
+        // LMR: trust ordering for late, quiet, non-checking moves. Don't
+        // reduce a move that we just extended.
         int reduction = 0;
-        if (depth >= LMR_MIN_DEPTH && moves_searched >= LMR_MIN_MOVES
+        if (extension == 0 && depth >= LMR_MIN_DEPTH && moves_searched >= LMR_MIN_MOVES
             && is_quiet && !in_check) {
             reduction = 1 + int(std::log(double(depth)) * std::log(double(moves_searched + 1)) / 2.0);
             if (reduction > new_depth - 1) reduction = new_depth - 1;
@@ -342,10 +410,17 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
         }
     }
 
-    if (legal_count == 0)
+    if (legal_count == 0) {
+        // Stalemate-with-excluded-move would otherwise look like a real
+        // stalemate; report a neutral score and don't poison the TT.
+        if (excluded_move != MOVE_NONE) return alpha;
         return in_check ? -VALUE_MATE + ply : VALUE_DRAW;
+    }
 
-    if (!stop_flag_.load(std::memory_order_relaxed))
+    // Don't poison the TT during a singular-verification search: the score
+    // here measures "best minus the excluded move", not the true position
+    // score, and storing it would overwrite the real entry under this key.
+    if (excluded_move == MOVE_NONE && !stop_flag_.load(std::memory_order_relaxed))
         TT.store(b.key(), depth, score_to_tt(best_score, ply), flag, best_move);
     return best_score;
 }

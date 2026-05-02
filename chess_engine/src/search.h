@@ -97,6 +97,10 @@ private:
     int  pv_len_[MAX_PLY];
 
     bool time_up();
-    int  negamax(Board& b, int depth, int ply, int alpha, int beta, bool allow_null);
+    // excluded_move (MOVE_NONE if unused) is for the singular-extension
+    // verification re-search: the move loop skips it so we measure how the
+    // node fares when the candidate singular move is unavailable.
+    int  negamax(Board& b, int depth, int ply, int alpha, int beta, bool allow_null,
+                 Move excluded_move = MOVE_NONE);
     int  quiescence(Board& b, int ply, int alpha, int beta);
 };
