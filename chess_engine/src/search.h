@@ -7,6 +7,12 @@
 #include <chrono>
 #include <functional>
 
+// Process-wide history table, shared across all Lazy SMP search threads.
+// Updated atomically via fetch_add on cutoffs; read with relaxed loads in the
+// MovePicker. Cleared on `ucinewgame`.
+extern std::atomic<int> g_history[16][64];
+void clear_shared_history();
+
 struct SearchLimits {
     int    depth     = MAX_PLY;
     int64_t movetime = 0;          // 0 = ignore
@@ -39,15 +45,19 @@ public:
 
     uint64_t nodes_searched() const { return nodes_; }
 
+    // Thread index: 0 = main thread, >=1 = helper. Used for depth staggering
+    // so helpers explore different plies first, diversifying search.
+    void set_thread_id(int id) { thread_id_ = id; }
+
 private:
     std::atomic<bool> stop_flag_{false};
     uint64_t nodes_ = 0;
     int      seldepth_ = 0;
+    int      thread_id_ = 0;
     std::chrono::steady_clock::time_point start_tp_;
     int64_t  hard_time_limit_ = 0;  // milliseconds; -1 = none
 
     Move killers_[MAX_PLY][2];
-    int  history_[16][64];          // history_[piece][to_square]
     Move countermove_[16][64];      // countermove_[prev_piece_moved][prev_to]
     Move pv_table_[MAX_PLY][MAX_PLY];
     int  pv_len_[MAX_PLY];

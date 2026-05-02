@@ -19,6 +19,10 @@
 #include <vector>
 #include <cstring>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 static const char* ENGINE_NAME    = "AIChessbot 0.2 (C++)";
 static const char* ENGINE_AUTHOR  = "AIChessbot";
 static const char* ENGINE_VERSION = "0.2";
@@ -29,7 +33,7 @@ static std::thread g_search_thread;
 
 struct EngineOptions {
     int hash_mb = 256;
-    int threads = 1;
+    int threads = 1;            // overwritten at init() to hardware_concurrency()
 };
 static EngineOptions g_opts;
 static int g_max_threads = 1;  // populated at startup from hardware_concurrency()
@@ -166,12 +170,18 @@ static void uci_go(std::istringstream& iss) {
         for (int i = 0; i < n_threads; ++i) {
             boards.push_back(root);
             searchers.push_back(std::make_unique<Searcher>());
+            searchers.back()->set_thread_id(i);
         }
 
         std::vector<std::thread> helpers;
         helpers.reserve(n_threads - 1);
         for (int i = 1; i < n_threads; ++i) {
             helpers.emplace_back([&, i]() {
+#ifdef _WIN32
+                // Pin helper i to logical CPU i for cache-locality on NUMA hosts.
+                DWORD_PTR mask = DWORD_PTR(1) << (unsigned(i) % 64u);
+                SetThreadAffinityMask(GetCurrentThread(), mask);
+#endif
                 searchers[i]->start(boards[i], lim,
                                     [](const SearchInfo&) {},   // no info from helpers
                                     [](Move) {});               // no bestmove from helpers
@@ -179,6 +189,9 @@ static void uci_go(std::istringstream& iss) {
         }
 
         // Main search.
+#ifdef _WIN32
+        SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1));
+#endif
         searchers[0]->start(boards[0], lim, on_info, on_bestmove);
 
         // Stop and join helpers before destroying their boards/searchers.
@@ -292,6 +305,8 @@ int main(int argc, char** argv) {
     TT.resize(256);
     g_max_threads = int(std::thread::hardware_concurrency());
     if (g_max_threads <= 0) g_max_threads = 1;
+    g_opts.threads = g_max_threads;          // default to all cores
+    clear_shared_history();
     g_board.set("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 
     // CLI: `chess_engine bench [depth]` runs bench and exits.
@@ -312,7 +327,8 @@ int main(int argc, char** argv) {
             std::cout << "id name " << ENGINE_NAME << '\n';
             std::cout << "id author " << ENGINE_AUTHOR << '\n';
             std::cout << "option name Hash type spin default 256 min 1 max 65536\n";
-            std::cout << "option name Threads type spin default 1 min 1 max " << g_max_threads << "\n";
+            std::cout << "option name Threads type spin default " << g_max_threads
+                      << " min 1 max " << g_max_threads << "\n";
             std::cout << "option name Book type string default \n";
             std::cout << "option name EvalFile type string default \n";
             std::cout << "option name SyzygyPath type string default <empty>\n";
@@ -323,6 +339,7 @@ int main(int argc, char** argv) {
         } else if (cmd == "ucinewgame") {
             wait_for_search();
             TT.clear();
+            clear_shared_history();
             g_board.set("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         } else if (cmd == "position") {
             uci_position(iss);

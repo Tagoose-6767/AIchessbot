@@ -13,6 +13,15 @@
 
 std::atomic<bool> g_search_stop{false};
 
+// Process-wide history shared across Lazy SMP threads.
+std::atomic<int> g_history[16][64];
+
+void clear_shared_history() {
+    for (int p = 0; p < 16; ++p)
+        for (int sq = 0; sq < 64; ++sq)
+            g_history[p][sq].store(0, std::memory_order_relaxed);
+}
+
 namespace {
 constexpr int ASPIRATION_DELTA = 25;
 constexpr int RAZOR_MARGIN[4]  = { 0, 250, 400, 0 };
@@ -195,7 +204,7 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
     }
 
     // --- Staged move generation ---
-    MovePicker mp(b, tt_move, killers_[ply], history_);
+    MovePicker mp(b, tt_move, killers_[ply], g_history);
 
     // Frontier futility precondition.
     bool do_futility = (!in_check && !is_pv && depth <= 4
@@ -271,11 +280,19 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
                             killers_[ply][0] = m;
                         }
                         Piece p = b.piece_on(from_sq(m));
-                        history_[p][to_sq(m)] += depth * depth;
-                        // Cap history to avoid runaway numbers.
-                        if (history_[p][to_sq(m)] > (1 << 18))
-                            for (int pp = 0; pp < 16; pp++) for (int sq = 0; sq < 64; sq++)
-                                history_[pp][sq] /= 2;
+                        int new_val = g_history[p][to_sq(m)]
+                            .fetch_add(depth * depth, std::memory_order_relaxed)
+                            + depth * depth;
+                        // Cap history to avoid runaway numbers. Race-tolerant:
+                        // multiple threads may divide concurrently; values are
+                        // heuristic so transient inconsistency is harmless.
+                        if (new_val > (1 << 18)) {
+                            for (int pp = 0; pp < 16; pp++)
+                                for (int sq = 0; sq < 64; sq++) {
+                                    int v = g_history[pp][sq].load(std::memory_order_relaxed);
+                                    g_history[pp][sq].store(v / 2, std::memory_order_relaxed);
+                                }
+                        }
                     }
                     break;
                 }
@@ -321,16 +338,29 @@ void Searcher::start(Board& b, const SearchLimits& lim,
     hard_time_limit_ = hard;
 
     std::memset(killers_, 0, sizeof(killers_));
-    std::memset(history_, 0, sizeof(history_));
     std::memset(countermove_, 0, sizeof(countermove_));
     std::memset(pv_len_, 0, sizeof(pv_len_));
+    // Main thread (or single-threaded bench) clears shared atomic history so
+    // each search starts with a clean ordering signal. Helpers piggy-back.
+    if (thread_id_ == 0) clear_shared_history();
     TT.new_search();
+
+    // Lazy SMP depth staggering: helpers offset their starting depth and skip
+    // some plies to diversify the search tree relative to the main thread.
+    // Stockfish-style 20-entry skip pattern.
+    constexpr int SKIP_PLIES[20] = { 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4 };
+    constexpr int SKIP_PHASE[20] = { 0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7 };
 
     Move best_move = MOVE_NONE;
     int  best_score = 0;
     int max_d = std::min(lim.depth, MAX_PLY - 1);
 
     for (int depth = 1; depth <= max_d; depth++) {
+        // Skip selected depths on helper threads to diversify search.
+        if (thread_id_ > 0) {
+            int idx = (thread_id_ - 1) % 20;
+            if (((depth + SKIP_PHASE[idx]) / SKIP_PLIES[idx]) % 2 != 0) continue;
+        }
         seldepth_ = 0;
         int alpha, beta, delta = ASPIRATION_DELTA;
         if (depth >= 4 && !is_mate(best_score)) {

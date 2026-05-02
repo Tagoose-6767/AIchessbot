@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include "board.h"
+#include <atomic>
 
 // One-time init of magic bitboards and pawn/knight/king attack tables.
 void init_movegen();
@@ -74,7 +75,7 @@ public:
     MovePicker(const Board& b,
                Move tt_move,
                const Move* killers,
-               int (*history)[64]);
+               std::atomic<int> (*history)[64]);
 
     Move next();
     Stage stage() const { return stage_; }
@@ -83,7 +84,7 @@ private:
     const Board* b_;
     Stage stage_ = ST_TT;
     Move tt_move_, killer1_, killer2_;
-    int (*history_)[64];
+    std::atomic<int> (*history_)[64];
 
     MoveList caps_;
     MoveList quiets_;

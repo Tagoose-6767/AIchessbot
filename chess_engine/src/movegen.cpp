@@ -393,7 +393,7 @@ void generate_legal(const Board& b, MoveList& list) {
 MovePicker::MovePicker(const Board& b,
                        Move tt_move,
                        const Move* killers,
-                       int (*history)[64])
+                       std::atomic<int> (*history)[64])
     : b_(&b),
       tt_move_(tt_move),
       killer1_(killers[0]),
@@ -441,7 +441,8 @@ void MovePicker::generate_and_score_quiets() {
         Move m = all.moves[i].move;
         if (m == tt_move_ || m == killer1_ || m == killer2_) continue;
         Piece p = b_->piece_on(from_sq(m));
-        quiets_.moves[quiets_.size++] = { m, history_[p][to_sq(m)] };
+        quiets_.moves[quiets_.size++] = { m,
+            history_[p][to_sq(m)].load(std::memory_order_relaxed) };
     }
     std::sort(quiets_.moves, quiets_.moves + quiets_.size,
               [](const ExtMove& a, const ExtMove& b) { return a.score > b.score; });
