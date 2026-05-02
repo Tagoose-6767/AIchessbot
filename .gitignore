@@ -10,6 +10,7 @@ selfplay.pgn
 *.o
 *.obj
 *.exe
+*.dll
 build/
 chess_engine/chess_engine
 
