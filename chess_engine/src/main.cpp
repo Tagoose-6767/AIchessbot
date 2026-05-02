@@ -8,6 +8,7 @@
 #include "book.h"
 #include "evaluate.h"
 #include "nnue.h"
+#include "syzygy.h"
 
 #include <atomic>
 #include <chrono>
@@ -129,6 +130,26 @@ static void uci_go(std::istringstream& iss) {
         }
     }
 
+    // Root Syzygy probe — perfect endgame play once <=5 pieces.
+    if (Syzygy::active() && popcount(g_board.pieces()) <= Syzygy::largest()
+        && g_board.castling() == 0) {
+        int tb_score = 0;
+        Move tb_move = MOVE_NONE;
+        if (Syzygy::probe_root(g_board, tb_score, tb_move) && tb_move != MOVE_NONE) {
+            SearchInfo info{};
+            info.depth = info.seldepth = 1;
+            info.score = tb_score;
+            info.nodes = 1;
+            info.nps   = 0;
+            info.time_ms = 0;
+            info.pv[0] = tb_move;
+            info.pv_len = 1;
+            on_info(info);
+            std::cout << "bestmove " << move_to_uci(tb_move) << std::endl;
+            return;
+        }
+    }
+
     g_search_stop.store(false);
     int n_threads = g_opts.threads < 1 ? 1 : g_opts.threads;
     Board root = g_board;  // canonical root copied here before threads diverge
@@ -190,6 +211,8 @@ static void uci_setoption(std::istringstream& iss) {
         else if (!NNUE::load(value)) {
             std::cerr << "info string EvalFile load failed; using HCE\n";
         }
+    } else if (name == "SyzygyPath") {
+        Syzygy::init(value);
     }
 }
 
@@ -292,6 +315,7 @@ int main(int argc, char** argv) {
             std::cout << "option name Threads type spin default 1 min 1 max " << g_max_threads << "\n";
             std::cout << "option name Book type string default \n";
             std::cout << "option name EvalFile type string default \n";
+            std::cout << "option name SyzygyPath type string default <empty>\n";
             std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             wait_for_search();
@@ -312,6 +336,7 @@ int main(int argc, char** argv) {
         } else if (cmd == "quit") {
             g_search_stop.store(true);
             wait_for_search();
+            Syzygy::free();
             break;
         } else if (cmd == "perft") {
             int d = 4;

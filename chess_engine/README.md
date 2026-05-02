@@ -79,6 +79,27 @@ Free Polyglot books to try:
 - gm2600.bin (titled-player games)
 - KomodoVariety.bin (varied lines)
 
+### Syzygy endgame tablebases
+
+The C++ engine ships with embedded Fathom probes (see `src/fathom/`). Once
+the position has at most 5 pieces (any combination), the engine queries the
+tablebase at the root and during search for perfect endgame play.
+
+Download the 5-piece WDL (`.rtbw`) and DTZ (`.rtbz`) files from any of:
+
+- `http://tablebase.sesse.net/syzygy/3-4-5/`  (≈ 1 GB total)
+- `https://syzygy-tables.info/`
+
+Place them in a single directory and tell the engine where to find them:
+
+```
+setoption name SyzygyPath value /path/to/syzygy
+```
+
+The engine logs `info string SyzygyPath: loaded, TB_LARGEST=5` to stderr when
+files are found. It silently skips probing when the path is unset, missing,
+or empty.
+
 ## Tests
 
 Move-generation correctness:

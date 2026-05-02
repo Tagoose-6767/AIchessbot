@@ -4,6 +4,7 @@
 #include "movegen.h"
 #include "evaluate.h"
 #include "tt.h"
+#include "syzygy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -147,6 +148,24 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
         if (tte->bound == BOUND_EXACT) return s;
         if (tte->bound == BOUND_LOWER && s >= beta)  return s;
         if (tte->bound == BOUND_UPPER && s <= alpha) return s;
+    }
+
+    // --- Syzygy WDL probe ----
+    // Cheap and safe: requires no castling rights (TB ignores castling), and the
+    // 50-move clock must have just been reset by an irreversible move so that
+    // TB rule50 effects don't mislead us. Skip on root and inside qsearch.
+    if (ply > 0 && Syzygy::active()
+        && popcount(b.pieces()) <= Syzygy::largest()
+        && b.castling() == 0
+        && b.halfmove_clock() == 0) {
+        int tb_score = 0;
+        if (Syzygy::probe_wdl(b, tb_score)) {
+            // Clamp into TB-mate band (already done by probe_wdl). Store as exact.
+            if (!stop_flag_.load(std::memory_order_relaxed))
+                TT.store(b.key(), depth, score_to_tt(tb_score, ply),
+                         BOUND_EXACT, MOVE_NONE);
+            return tb_score;
+        }
     }
 
     int static_eval = in_check ? VALUE_NONE : evaluate(b);

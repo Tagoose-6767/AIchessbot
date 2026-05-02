@@ -17,8 +17,16 @@ else
 endif
 
 SRC_DIR := src
-SRCS    := $(wildcard $(SRC_DIR)/*.cpp)
+SRCS    := $(wildcard $(SRC_DIR)/*.cpp) $(SRC_DIR)/fathom/tbprobe.cpp
 OBJS    := $(SRCS:.cpp=.o)
+
+# Fathom (Syzygy) compile flags: silence its many -Wall warnings, allow
+# its C-style casts and unused returns without polluting our own build noise.
+$(SRC_DIR)/fathom/tbprobe.o: CXXFLAGS += -Wno-all -Wno-extra -Wno-unused-but-set-variable \
+    -Wno-sign-compare -Wno-unused-function -Wno-unused-variable \
+    -Wno-strict-aliasing -Wno-format -Wno-pointer-arith \
+    -Wno-implicit-fallthrough -Wno-deprecated-declarations \
+    -Wno-class-memaccess -Wno-conversion-null -Wno-cast-function-type
 
 .PHONY: all debug clean perft bench
 
