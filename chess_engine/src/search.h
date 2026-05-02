@@ -14,6 +14,14 @@
 extern std::atomic<int> g_history[16][64];
 void clear_shared_history();
 
+// --- Diagnostic logging ------------------------------------------------------
+// dbg_log writes to stderr with a steady-clock millisecond timestamp. Used to
+// trace UCI lifecycle and search-thread events when investigating disconnects
+// (Cute Chess captures stderr to its engine debug pane). Default ON; disable
+// at runtime by exporting CHESS_ENGINE_DEBUG=0 before launching the engine.
+extern std::atomic<bool> g_dbg_enabled;
+void dbg_log(const std::string& msg);
+
 struct SearchLimits {
     int    depth     = MAX_PLY;
     int64_t movetime = 0;          // 0 = ignore

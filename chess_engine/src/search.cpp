@@ -15,19 +15,47 @@ std::atomic<bool> g_search_stop{false};
 std::atomic<bool> g_is_pondering{false};
 std::atomic<int64_t> g_search_deadline_ms{INT64_MAX};
 
+// Default-on diagnostic logger; main() flips it off if CHESS_ENGINE_DEBUG=0.
+std::atomic<bool> g_dbg_enabled{true};
+void dbg_log(const std::string& msg) {
+    if (!g_dbg_enabled.load(std::memory_order_relaxed)) return;
+    // One write to a single std::cerr line is atomic enough for diagnostic
+    // use; stream operator<< on std::cerr is not, so we build the line first.
+    std::string line = "[dbg " + std::to_string(now_steady_ms()) + "] " + msg + '\n';
+    std::cerr << line;
+    std::cerr.flush();
+}
+
 // Process-wide history shared across Lazy SMP threads.
 std::atomic<int> g_history[16][64];
 
+// Returns the time budget (ms) for this move. Sentinel -1 means "no deadline"
+// (true infinite mode). A return of 0 was the previous bug -- start() treats
+// budget<=0 as "no deadline" and the engine then runs forever, which Cute
+// Chess sees as a missing bestmove and forfeits the game. The new contract:
+// any time-controlled search returns at least 1 ms so the deadline is real.
 int64_t compute_time_budget(const SearchLimits& lim, Color stm) {
-    if (lim.infinite) return 0;
-    if (lim.movetime > 0) return lim.movetime;
+    if (lim.infinite) return -1;
+    if (lim.movetime > 0) return std::max<int64_t>(lim.movetime, 1);
+
+    // If the GUI sent no time fields at all (e.g. plain "go" or "go depth N"),
+    // treat as analysis -- depth/nodes limit will stop us.
+    bool has_time_control =
+        lim.time[WHITE] > 0 || lim.time[BLACK] > 0
+     || lim.inc[WHITE]  > 0 || lim.inc[BLACK]  > 0;
+    if (!has_time_control) return -1;
+
     int64_t our_time = lim.time[stm];
     int64_t our_inc  = lim.inc[stm];
-    if (our_time <= 0) return 0;
+    // We're under a real time control but have effectively no clock. Emit
+    // a move ASAP rather than searching forever and getting time-forfeited.
+    if (our_time <= 0) return 1;
+
     int mtg = lim.movestogo > 0 ? lim.movestogo : 30;
     int64_t target = our_time / mtg + our_inc * 70 / 100;
-    if (target < 10) target = 10;
-    if (target > our_time / 4) target = our_time / 4;
+    int64_t cap = std::max<int64_t>(our_time / 4, 1);
+    if (target > cap) target = cap;
+    if (target < 1)   target = 1;
     return target;
 }
 
@@ -336,12 +364,19 @@ void Searcher::start(Board& b, const SearchLimits& lim,
     // Only the main thread programs the global deadline. Helpers piggy-back on
     // it (and on g_search_stop). Pondering and infinite searches install no
     // deadline; ponderhit will rewrite it from the UCI thread when the
-    // expected move actually arrives.
+    // expected move actually arrives. budget < 0 is the "no deadline" sentinel
+    // from compute_time_budget (infinite mode / no time control); a strict
+    // less-than is required because budget == 0 used to silently mean "no
+    // deadline" too and that was the disconnect bug.
     if (thread_id_ == 0) {
         int64_t budget = compute_time_budget(lim, b.side_to_move());
-        int64_t deadline = (lim.ponder || budget <= 0) ? INT64_MAX
-                                                       : now_steady_ms() + budget;
+        int64_t deadline = (lim.ponder || budget < 0) ? INT64_MAX
+                                                      : now_steady_ms() + budget;
         g_search_deadline_ms.store(deadline, std::memory_order_relaxed);
+        dbg_log("searcher start: stm=" + std::string(b.side_to_move()==WHITE?"w":"b")
+                + " budget_ms=" + std::to_string(budget)
+                + " deadline_abs_ms=" + (deadline == INT64_MAX ? "INF" : std::to_string(deadline))
+                + " ponder=" + (lim.ponder?"1":"0"));
     }
 
     std::memset(killers_, 0, sizeof(killers_));
@@ -362,6 +397,21 @@ void Searcher::start(Board& b, const SearchLimits& lim,
     Move ponder_move = MOVE_NONE;   // PV[1] from the last completed iteration
     int  best_score = 0;
     int max_d = std::min(lim.depth, MAX_PLY - 1);
+
+    // Always have a fallback bestmove so we NEVER emit "0000" when legal moves
+    // exist. The previous behavior under low time was: depth-1's first root
+    // move's subtree trips time_up before pv_table_[0][0] is assigned -> we
+    // returned MOVE_NONE -> Cute Chess saw "bestmove 0000" with legal moves
+    // available -> game forfeit / disconnect. The first legal move is a fine
+    // emergency pick; iterative deepening overwrites it on every completed
+    // root iteration. Only the main thread bothers (helpers don't emit).
+    if (thread_id_ == 0) {
+        MoveList ml;
+        generate_legal(b, ml);
+        if (ml.size > 0) best_move = ml.moves[0].move;
+        dbg_log("root legal moves: " + std::to_string(ml.size)
+                + " fallback=" + (best_move==MOVE_NONE?"none":move_to_uci(best_move)));
+    }
 
     for (int depth = 1; depth <= max_d; depth++) {
         // Skip selected depths on helper threads to diversify search.
@@ -423,5 +473,15 @@ void Searcher::start(Board& b, const SearchLimits& lim,
         if (is_mate(best_score)) break;
     }
 
+    if (thread_id_ == 0) {
+        dbg_log("searcher end: best=" + std::string(best_move==MOVE_NONE?"0000":move_to_uci(best_move))
+                + " ponder=" + std::string(ponder_move==MOVE_NONE?"-":move_to_uci(ponder_move))
+                + " score=" + std::to_string(best_score)
+                + " nodes=" + std::to_string(nodes_));
+        if (best_move == MOVE_NONE) {
+            // True mate/stalemate at root, OR a search bug we want to know about.
+            dbg_log("WARN: emitting MOVE_NONE -- check for mate/stalemate at root");
+        }
+    }
     if (on_bestmove) on_bestmove(best_move, ponder_move);
 }

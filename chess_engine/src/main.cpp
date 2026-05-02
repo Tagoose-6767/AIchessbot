@@ -98,9 +98,14 @@ static void on_info(const SearchInfo& i) {
 }
 
 static void on_bestmove(Move m, Move ponder) {
-    std::cout << "bestmove " << (m == MOVE_NONE ? "0000" : move_to_uci(m));
-    if (ponder != MOVE_NONE) std::cout << " ponder " << move_to_uci(ponder);
-    std::cout << std::endl;
+    std::string line = "bestmove ";
+    line += (m == MOVE_NONE ? "0000" : move_to_uci(m));
+    if (ponder != MOVE_NONE) {
+        line += " ponder ";
+        line += move_to_uci(ponder);
+    }
+    dbg_log("emit " + line);
+    std::cout << line << std::endl;
 }
 
 static void wait_for_search() {
@@ -165,6 +170,17 @@ static void uci_go(std::istringstream& iss) {
     g_pending_stm    = g_board.side_to_move();
     g_is_pondering.store(lim.ponder, std::memory_order_relaxed);
 
+    dbg_log(std::string("go: stm=") + (g_board.side_to_move()==WHITE?"w":"b")
+            + " depth=" + std::to_string(lim.depth)
+            + " movetime=" + std::to_string(lim.movetime)
+            + " wtime=" + std::to_string(lim.time[WHITE])
+            + " btime=" + std::to_string(lim.time[BLACK])
+            + " winc=" + std::to_string(lim.inc[WHITE])
+            + " binc=" + std::to_string(lim.inc[BLACK])
+            + " movestogo=" + std::to_string(lim.movestogo)
+            + " infinite=" + (lim.infinite?"1":"0")
+            + " ponder=" + (lim.ponder?"1":"0"));
+
     // Try book first. Skip when pondering: under "go ponder" the engine must
     // keep searching until ponderhit/stop, even if the predicted position
     // happens to be in book.
@@ -201,6 +217,8 @@ static void uci_go(std::istringstream& iss) {
     g_search_stop.store(false);
     int n_threads = g_opts.threads < 1 ? 1 : g_opts.threads;
     Board root = g_board;  // canonical root copied here before threads diverge
+
+    dbg_log("spawning search thread n_threads=" + std::to_string(n_threads));
 
     g_search_thread = std::thread([lim, n_threads, root]() mutable {
         // Lazy SMP: each thread gets its own Board + Searcher; they all share
@@ -239,9 +257,11 @@ static void uci_go(std::istringstream& iss) {
         searchers[0]->start(boards[0], lim, on_info, on_bestmove);
 
         // Stop and join helpers before destroying their boards/searchers.
+        dbg_log("main searcher returned; joining helpers");
         g_search_stop.store(true);
         for (auto& s : searchers) s->stop();
         for (auto& t : helpers) if (t.joinable()) t.join();
+        dbg_log("search thread cleanup done");
     });
 }
 
@@ -371,6 +391,12 @@ int main(int argc, char** argv) {
     clear_shared_history();
     g_board.set("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 
+    // Diagnostic logger: on by default, opt-out via CHESS_ENGINE_DEBUG=0.
+    if (const char* d = std::getenv("CHESS_ENGINE_DEBUG"); d && d[0] == '0') {
+        g_dbg_enabled.store(false);
+    }
+    dbg_log("engine start; max_threads=" + std::to_string(g_max_threads));
+
     // Auto-load the bundled NNUE relative to the executable, so GUIs that
     // launch the engine from a different CWD get NNUE eval out of the box.
     NNUE::set_search_dir(executable_dir());
@@ -386,6 +412,7 @@ int main(int argc, char** argv) {
 
     std::string line;
     while (std::getline(std::cin, line)) {
+        dbg_log("recv: " + line);
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
@@ -417,9 +444,12 @@ int main(int argc, char** argv) {
             // Stops every searcher (main + Lazy SMP helpers) via the global
             // flag that all of them poll inside time_up(). Also covers the
             // "ponder, then opponent played a different move" case.
+            dbg_log("stop received; was_pondering=" +
+                    std::string(g_is_pondering.load() ? "1" : "0"));
             g_is_pondering.store(false, std::memory_order_relaxed);
             g_search_stop.store(true);
             wait_for_search();
+            dbg_log("stop: search joined");
         } else if (cmd == "ponderhit") {
             // Opponent played the move we predicted -- the running ponder
             // search IS the search for the current position. Convert it from
@@ -431,6 +461,8 @@ int main(int argc, char** argv) {
             int64_t budget = compute_time_budget(g_pending_limits, g_pending_stm);
             int64_t deadline = budget > 0 ? now_steady_ms() + budget : INT64_MAX;
             g_search_deadline_ms.store(deadline, std::memory_order_relaxed);
+            dbg_log("ponderhit: budget_ms=" + std::to_string(budget)
+                    + " new_deadline_abs_ms=" + (deadline == INT64_MAX ? "INF" : std::to_string(deadline)));
         } else if (cmd == "setoption") {
             uci_setoption(iss);
         } else if (cmd == "quit") {
