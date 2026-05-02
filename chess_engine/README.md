@@ -74,10 +74,27 @@ Polyglot `.bin` file before launching, or send the UCI command:
 setoption name Book value /path/to/Performance.bin
 ```
 
-Free Polyglot books to try:
-- Performance.bin (small, generic)
-- gm2600.bin (titled-player games)
-- KomodoVariety.bin (varied lines)
+The repo ships with a fetch script that pulls a GM-level Polyglot book
+(`gm2600.bin`, ~340 KB, positions filtered to games where both players are
+≥2600 Elo, originally from Scid vs PC, credit Pascal Georges):
+
+```bash
+bash tools/fetch_book.sh           # default: gm2600
+bash tools/fetch_book.sh elo2400   # alternative GM-curated book
+bash tools/fetch_book.sh dec2015   # Lichess-derived, deeper/more variety
+```
+
+The downloaded file lands in `books/` (gitignored). Then in your UCI GUI
+or via raw UCI:
+
+```
+setoption name Book value books/gm2600.bin
+```
+
+The engine queries the book on every move; effective book depth is set by
+the file's coverage, not by an engine-side move-number cap. `gm2600.bin`
+covers most well-known main lines into the early middlegame (move 12–20
+on common openings).
 
 ### Syzygy endgame tablebases
 
