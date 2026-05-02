@@ -368,11 +368,14 @@ void Searcher::start(Board& b, const SearchLimits& lim,
     // from compute_time_budget (infinite mode / no time control); a strict
     // less-than is required because budget == 0 used to silently mean "no
     // deadline" too and that was the disconnect bug.
+    int64_t search_start_ms     = now_steady_ms();
+    int64_t initial_deadline_ms = INT64_MAX;     // baseline for adjustments
     if (thread_id_ == 0) {
         int64_t budget = compute_time_budget(lim, b.side_to_move());
         int64_t deadline = (lim.ponder || budget < 0) ? INT64_MAX
-                                                      : now_steady_ms() + budget;
+                                                      : search_start_ms + budget;
         g_search_deadline_ms.store(deadline, std::memory_order_relaxed);
+        initial_deadline_ms = deadline;
         dbg_log("searcher start: stm=" + std::string(b.side_to_move()==WHITE?"w":"b")
                 + " budget_ms=" + std::to_string(budget)
                 + " deadline_abs_ms=" + (deadline == INT64_MAX ? "INF" : std::to_string(deadline))
@@ -397,6 +400,15 @@ void Searcher::start(Board& b, const SearchLimits& lim,
     Move ponder_move = MOVE_NONE;   // PV[1] from the last completed iteration
     int  best_score = 0;
     int max_d = std::min(lim.depth, MAX_PLY - 1);
+
+    // Cross-iteration state for dynamic time management. Updated only on the
+    // main thread; helpers don't manage time. See the per-iteration block at
+    // the bottom of the loop for the actual adjustment policy.
+    Move prev_best_move      = MOVE_NONE;
+    int  prev_best_score     = 0;
+    int  stable_iters        = 0;
+    bool time_steal_applied  = false;
+    bool clarity_applied     = false;
 
     // Always have a fallback bestmove so we NEVER emit "0000" when legal moves
     // exist. The previous behavior under low time was: depth-1's first root
@@ -469,6 +481,91 @@ void Searcher::start(Board& b, const SearchLimits& lim,
         info.pv_len = pv_len_[0];
         for (int i = 0; i < pv_len_[0]; i++) info.pv[i] = pv_table_[0][i];
         if (on_info) on_info(info);
+
+        // --- Dynamic time management (main thread only) -------------------
+        // After each completed iteration we may shrink or extend the deadline
+        // based on (a) how stable the best move is and (b) how stable / clear
+        // the score is. Helpers don't touch the deadline. We also handle
+        // ponderhit: the ponder search starts with an INF deadline; once the
+        // ponderhit handler installs a real one, we baseline it here so the
+        // adjustments below have something to scale against.
+        if (thread_id_ == 0) {
+            int64_t now_ms = now_steady_ms();
+            int64_t deadline = g_search_deadline_ms.load(std::memory_order_relaxed);
+
+            if (initial_deadline_ms == INT64_MAX && deadline != INT64_MAX) {
+                // ponderhit just promoted us from infinite to time-limited.
+                initial_deadline_ms = deadline;
+                search_start_ms = now_ms;
+                stable_iters = 0;
+                time_steal_applied = clarity_applied = false;
+                dbg_log("time-mgmt: baselined deadline after ponderhit, budget="
+                        + std::to_string(deadline - now_ms) + "ms");
+            }
+
+            if (deadline != INT64_MAX && initial_deadline_ms != INT64_MAX) {
+                int64_t orig_budget = initial_deadline_ms - search_start_ms;
+                if (orig_budget > 0) {
+                    // Track best-move stability. Reset on change so a fresh
+                    // 5-iter streak can re-trigger time stealing later.
+                    if (best_move == prev_best_move && best_move != MOVE_NONE) {
+                        ++stable_iters;
+                    } else {
+                        stable_iters = 0;
+                        time_steal_applied = false;
+                    }
+
+                    int64_t adj = deadline;
+
+                    // (1) Time stealing: 5+ stable iterations -> cut remaining 40%.
+                    //     Spec: "if a move has been best for 5+ consecutive
+                    //     iterations, cut time by 40%".
+                    if (stable_iters >= 5 && !time_steal_applied) {
+                        int64_t remaining = adj - now_ms;
+                        if (remaining > 0) {
+                            adj = now_ms + remaining * 60 / 100;
+                            time_steal_applied = true;
+                            dbg_log("time-mgmt: STEAL stable=" + std::to_string(stable_iters)
+                                    + " new_remaining=" + std::to_string(adj - now_ms) + "ms");
+                        }
+                    }
+
+                    // (2) Panic: eval dropped >50cp from prev iteration -> +50%
+                    //     of original budget. Capped at 3x original to keep one
+                    //     bad move from eating the whole clock.
+                    if (depth >= 3 && best_score < prev_best_score - 50) {
+                        int64_t cap = search_start_ms + orig_budget * 3;
+                        int64_t extended = std::min(adj + orig_budget / 2, cap);
+                        if (extended > adj) {
+                            dbg_log("time-mgmt: PANIC drop=" + std::to_string(prev_best_score - best_score)
+                                    + "cp extend=" + std::to_string(extended - adj) + "ms");
+                            adj = extended;
+                        }
+                    }
+
+                    // (3) Clarity: |score| > 600 (clearly winning/losing, not a
+                    //     mate score) -> cut remaining 30% (once). Saves time
+                    //     when the position is decided.
+                    int abs_score = std::abs(best_score);
+                    if (abs_score > 600 && abs_score < VALUE_MATE_IN_MAX_PLY
+                        && !clarity_applied) {
+                        int64_t remaining = adj - now_ms;
+                        if (remaining > 0) {
+                            adj = now_ms + remaining * 70 / 100;
+                            clarity_applied = true;
+                            dbg_log("time-mgmt: CLARITY |score|=" + std::to_string(abs_score)
+                                    + " new_remaining=" + std::to_string(adj - now_ms) + "ms");
+                        }
+                    }
+
+                    if (adj != deadline) {
+                        g_search_deadline_ms.store(adj, std::memory_order_relaxed);
+                    }
+                }
+            }
+            prev_best_move  = best_move;
+            prev_best_score = best_score;
+        }
 
         if (is_mate(best_score)) break;
     }
