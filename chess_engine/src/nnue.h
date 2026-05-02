@@ -29,6 +29,14 @@ class Board;
 struct StateInfo;
 
 namespace NNUE {
+    // Fallback search dir for relative paths in load(). Set at startup to the
+    // executable's directory so a GUI launching the engine from a different
+    // CWD still resolves "nets/foo.nnue".
+    void set_search_dir(const std::string& dir);
+
+    // Auto-loaded at startup; also re-tried when EvalFile is "" or "<auto>".
+    extern const char* DEFAULT_NET;
+
     bool load(const std::string& path);
     void unload();
     bool is_loaded();

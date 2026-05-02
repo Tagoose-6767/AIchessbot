@@ -21,7 +21,32 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#else
+#include <unistd.h>
 #endif
+
+// Directory containing the running executable (no trailing slash). Used as
+// NNUE's fallback search dir so relative paths like "nets/foo.nnue" resolve
+// even when a GUI launches the engine from a different working directory.
+static std::string executable_dir() {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    std::string p(buf, n);
+#elif defined(__APPLE__)
+    char buf[4096];
+    uint32_t sz = sizeof(buf);
+    std::string p = (_NSGetExecutablePath(buf, &sz) == 0) ? std::string(buf) : "";
+#else
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf));
+    std::string p = (n > 0) ? std::string(buf, n) : "";
+#endif
+    size_t s = p.find_last_of("/\\");
+    return s == std::string::npos ? std::string(".") : p.substr(0, s);
+}
 
 static const char* ENGINE_NAME    = "AIChessbot 0.2 (C++)";
 static const char* ENGINE_AUTHOR  = "AIChessbot";
@@ -32,11 +57,18 @@ static OpeningBook g_book;
 static std::thread g_search_thread;
 
 struct EngineOptions {
-    int hash_mb = 256;
-    int threads = 1;            // overwritten at init() to hardware_concurrency()
+    int  hash_mb = 256;
+    int  threads = 1;            // overwritten at init() to hardware_concurrency()
+    bool ponder  = false;        // surfaced via UCI; protocol-level hint to GUI.
 };
 static EngineOptions g_opts;
 static int g_max_threads = 1;  // populated at startup from hardware_concurrency()
+
+// Limits and side-to-move from the most recent "go" so the ponderhit handler
+// can compute the time budget for the now-time-limited search. Written by
+// uci_go before spawning the search thread; read by the ponderhit handler.
+static SearchLimits g_pending_limits;
+static Color        g_pending_stm = WHITE;
 
 static std::string score_to_uci(int s) {
     if (std::abs(s) >= VALUE_MATE_IN_MAX_PLY) {
@@ -65,8 +97,10 @@ static void on_info(const SearchInfo& i) {
     std::cout << ss.str() << std::endl;
 }
 
-static void on_bestmove(Move m) {
-    std::cout << "bestmove " << (m == MOVE_NONE ? "0000" : move_to_uci(m)) << std::endl;
+static void on_bestmove(Move m, Move ponder) {
+    std::cout << "bestmove " << (m == MOVE_NONE ? "0000" : move_to_uci(m));
+    if (ponder != MOVE_NONE) std::cout << " ponder " << move_to_uci(ponder);
+    std::cout << std::endl;
 }
 
 static void wait_for_search() {
@@ -123,10 +157,18 @@ static void uci_go(std::istringstream& iss) {
         else if (tok == "binc")      iss >> lim.inc[BLACK];
         else if (tok == "movestogo") iss >> lim.movestogo;
         else if (tok == "infinite")  lim.infinite = true;
+        else if (tok == "ponder")    lim.ponder = true;
     }
 
-    // Try book first.
-    if (g_book.loaded()) {
+    // Stash for ponderhit, which converts the running search to time-limited.
+    g_pending_limits = lim;
+    g_pending_stm    = g_board.side_to_move();
+    g_is_pondering.store(lim.ponder, std::memory_order_relaxed);
+
+    // Try book first. Skip when pondering: under "go ponder" the engine must
+    // keep searching until ponderhit/stop, even if the predicted position
+    // happens to be in book.
+    if (!lim.ponder && g_book.loaded()) {
         Move bm = g_book.find_move(g_board);
         if (bm != MOVE_NONE) {
             std::cout << "bestmove " << move_to_uci(bm) << std::endl;
@@ -134,8 +176,10 @@ static void uci_go(std::istringstream& iss) {
         }
     }
 
-    // Root Syzygy probe — perfect endgame play once <=5 pieces.
-    if (Syzygy::active() && popcount(g_board.pieces()) <= Syzygy::largest()
+    // Root Syzygy probe — perfect endgame play once <=5 pieces. Same ponder
+    // exclusion as the book: don't short-circuit a pondering search.
+    if (!lim.ponder
+        && Syzygy::active() && popcount(g_board.pieces()) <= Syzygy::largest()
         && g_board.castling() == 0) {
         int tb_score = 0;
         Move tb_move = MOVE_NONE;
@@ -183,8 +227,8 @@ static void uci_go(std::istringstream& iss) {
                 SetThreadAffinityMask(GetCurrentThread(), mask);
 #endif
                 searchers[i]->start(boards[i], lim,
-                                    [](const SearchInfo&) {},   // no info from helpers
-                                    [](Move) {});               // no bestmove from helpers
+                                    [](const SearchInfo&) {},     // no info from helpers
+                                    [](Move, Move) {});           // no bestmove from helpers
             });
         }
 
@@ -220,12 +264,24 @@ static void uci_setoption(std::istringstream& iss) {
         if (n > g_max_threads) n = g_max_threads;
         g_opts.threads = n;
     } else if (name == "EvalFile") {
-        if (value.empty()) NNUE::unload();
-        else if (!NNUE::load(value)) {
-            std::cerr << "info string EvalFile load failed; using HCE\n";
+        // "" / "<auto>" / "<empty>" all mean: re-try the bundled default net.
+        // "<none>" / "off" forces HCE. Anything else is treated as an explicit
+        // path (resolved by NNUE against CWD, then the executable dir).
+        if (value == "<none>" || value == "off") {
+            NNUE::unload();
+            std::cout << "info string nnue: unloaded; using HCE\n";
+        } else if (value.empty() || value == "<auto>" || value == "<empty>") {
+            if (!NNUE::load(NNUE::DEFAULT_NET))
+                std::cout << "info string EvalFile auto-load failed; using HCE\n";
+        } else if (!NNUE::load(value)) {
+            std::cout << "info string EvalFile load failed; using HCE\n";
         }
     } else if (name == "SyzygyPath") {
         Syzygy::init(value);
+    } else if (name == "Ponder") {
+        // Stored only — pondering is driven entirely by the GUI sending
+        // "go ponder"; this option is the protocol-level capability hint.
+        g_opts.ponder = (value == "true" || value == "1" || value == "True");
     }
 }
 
@@ -256,9 +312,15 @@ static void uci_bench(int depth) {
         Searcher s;
         std::atomic<uint64_t> nodes_here{ 0 };
         SearchInfo last_info{};
+        Move bench_best = MOVE_NONE, bench_ponder = MOVE_NONE;
         s.start(b, lim,
                 [&](const SearchInfo& si) { last_info = si; },
-                [&](Move) {});
+                [&](Move best, Move ponder) { bench_best = best; bench_ponder = ponder; });
+        std::cout << "bestmove "
+                  << (bench_best == MOVE_NONE ? "0000" : move_to_uci(bench_best));
+        if (bench_ponder != MOVE_NONE)
+            std::cout << " ponder " << move_to_uci(bench_ponder);
+        std::cout << std::endl;
         total_nodes += s.nodes_searched();
     }
     auto t1 = std::chrono::steady_clock::now();
@@ -309,6 +371,11 @@ int main(int argc, char** argv) {
     clear_shared_history();
     g_board.set("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 
+    // Auto-load the bundled NNUE relative to the executable, so GUIs that
+    // launch the engine from a different CWD get NNUE eval out of the box.
+    NNUE::set_search_dir(executable_dir());
+    NNUE::load(NNUE::DEFAULT_NET);
+
     // CLI: `chess_engine bench [depth]` runs bench and exits.
     if (argc >= 2 && std::string(argv[1]) == "bench") {
         int d = 13;
@@ -330,8 +397,9 @@ int main(int argc, char** argv) {
             std::cout << "option name Threads type spin default " << g_max_threads
                       << " min 1 max " << g_max_threads << "\n";
             std::cout << "option name Book type string default \n";
-            std::cout << "option name EvalFile type string default \n";
+            std::cout << "option name EvalFile type string default <auto>\n";
             std::cout << "option name SyzygyPath type string default <empty>\n";
+            std::cout << "option name Ponder type check default false\n";
             std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             wait_for_search();
@@ -346,8 +414,23 @@ int main(int argc, char** argv) {
         } else if (cmd == "go") {
             uci_go(iss);
         } else if (cmd == "stop") {
+            // Stops every searcher (main + Lazy SMP helpers) via the global
+            // flag that all of them poll inside time_up(). Also covers the
+            // "ponder, then opponent played a different move" case.
+            g_is_pondering.store(false, std::memory_order_relaxed);
             g_search_stop.store(true);
             wait_for_search();
+        } else if (cmd == "ponderhit") {
+            // Opponent played the move we predicted -- the running ponder
+            // search IS the search for the current position. Convert it from
+            // "no time limit" to time-limited by atomically programming the
+            // global deadline; the main searcher will pick it up on its next
+            // poll inside time_up(). Helpers ride along on the same deadline
+            // (and on g_search_stop), so SMP cleanup is automatic.
+            g_is_pondering.store(false, std::memory_order_relaxed);
+            int64_t budget = compute_time_budget(g_pending_limits, g_pending_stm);
+            int64_t deadline = budget > 0 ? now_steady_ms() + budget : INT64_MAX;
+            g_search_deadline_ms.store(deadline, std::memory_order_relaxed);
         } else if (cmd == "setoption") {
             uci_setoption(iss);
         } else if (cmd == "quit") {

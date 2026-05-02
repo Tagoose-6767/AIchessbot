@@ -12,9 +12,24 @@
 #include <iostream>
 
 std::atomic<bool> g_search_stop{false};
+std::atomic<bool> g_is_pondering{false};
+std::atomic<int64_t> g_search_deadline_ms{INT64_MAX};
 
 // Process-wide history shared across Lazy SMP threads.
 std::atomic<int> g_history[16][64];
+
+int64_t compute_time_budget(const SearchLimits& lim, Color stm) {
+    if (lim.infinite) return 0;
+    if (lim.movetime > 0) return lim.movetime;
+    int64_t our_time = lim.time[stm];
+    int64_t our_inc  = lim.inc[stm];
+    if (our_time <= 0) return 0;
+    int mtg = lim.movestogo > 0 ? lim.movestogo : 30;
+    int64_t target = our_time / mtg + our_inc * 70 / 100;
+    if (target < 10) target = 10;
+    if (target > our_time / 4) target = our_time / 4;
+    return target;
+}
 
 void clear_shared_history() {
     for (int p = 0; p < 16; ++p)
@@ -38,10 +53,9 @@ bool Searcher::time_up() {
         stop_flag_.store(true, std::memory_order_relaxed);
         return true;
     }
-    if (hard_time_limit_ <= 0) return false;
-    auto now = std::chrono::steady_clock::now();
-    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_tp_).count();
-    if (ms >= hard_time_limit_) {
+    int64_t deadline = g_search_deadline_ms.load(std::memory_order_relaxed);
+    if (deadline == INT64_MAX) return false;
+    if (now_steady_ms() >= deadline) {
         stop_flag_.store(true, std::memory_order_relaxed);
         return true;
     }
@@ -313,29 +327,22 @@ int Searcher::negamax(Board& b, int depth, int ply, int alpha, int beta, bool al
 // ---------------------------------------------------------------------------
 void Searcher::start(Board& b, const SearchLimits& lim,
                      std::function<void(const SearchInfo&)> on_info,
-                     std::function<void(Move)> on_bestmove) {
+                     std::function<void(Move, Move)> on_bestmove) {
     nodes_ = 0;
     seldepth_ = 0;
     stop_flag_.store(false);
     start_tp_ = std::chrono::steady_clock::now();
 
-    int64_t hard = -1;
-    if (!lim.infinite) {
-        if (lim.movetime > 0) {
-            hard = lim.movetime;
-        } else {
-            int64_t our_time = lim.time[b.side_to_move()];
-            int64_t our_inc  = lim.inc[b.side_to_move()];
-            if (our_time > 0) {
-                int mtg = lim.movestogo > 0 ? lim.movestogo : 30;
-                int64_t target = our_time / mtg + our_inc * 70 / 100;
-                if (target < 10) target = 10;
-                if (target > our_time / 4) target = our_time / 4;
-                hard = target;
-            }
-        }
+    // Only the main thread programs the global deadline. Helpers piggy-back on
+    // it (and on g_search_stop). Pondering and infinite searches install no
+    // deadline; ponderhit will rewrite it from the UCI thread when the
+    // expected move actually arrives.
+    if (thread_id_ == 0) {
+        int64_t budget = compute_time_budget(lim, b.side_to_move());
+        int64_t deadline = (lim.ponder || budget <= 0) ? INT64_MAX
+                                                       : now_steady_ms() + budget;
+        g_search_deadline_ms.store(deadline, std::memory_order_relaxed);
     }
-    hard_time_limit_ = hard;
 
     std::memset(killers_, 0, sizeof(killers_));
     std::memset(countermove_, 0, sizeof(countermove_));
@@ -352,6 +359,7 @@ void Searcher::start(Board& b, const SearchLimits& lim,
     constexpr int SKIP_PHASE[20] = { 0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7 };
 
     Move best_move = MOVE_NONE;
+    Move ponder_move = MOVE_NONE;   // PV[1] from the last completed iteration
     int  best_score = 0;
     int max_d = std::min(lim.depth, MAX_PLY - 1);
 
@@ -390,7 +398,14 @@ void Searcher::start(Board& b, const SearchLimits& lim,
         if (stop_flag_.load(std::memory_order_relaxed) && depth > 1) break;
         best_score = score;
 
-        if (pv_len_[0] > 0) best_move = pv_table_[0][0];
+        if (pv_len_[0] > 0) {
+            best_move = pv_table_[0][0];
+            // Capture the predicted opponent reply *here* (only when we just
+            // completed an iteration). Reading pv_len_[0] after the for-loop
+            // exits would race with the aspiration window's memset, which can
+            // wipe the PV before we reach the on_bestmove call.
+            ponder_move = (pv_len_[0] >= 2) ? pv_table_[0][1] : MOVE_NONE;
+        }
 
         // Emit info.
         SearchInfo info;
@@ -408,5 +423,5 @@ void Searcher::start(Board& b, const SearchLimits& lim,
         if (is_mate(best_score)) break;
     }
 
-    if (on_bestmove) on_bestmove(best_move);
+    if (on_bestmove) on_bestmove(best_move, ponder_move);
 }

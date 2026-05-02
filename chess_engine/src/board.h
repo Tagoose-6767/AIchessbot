@@ -2,6 +2,7 @@
 #pragma once
 
 #include "types.h"
+#include <memory>
 #include <string>
 
 struct StateInfo {
@@ -80,6 +81,15 @@ public:
     bool see_ge(Move m, int threshold = 0) const;
 
 private:
+    // Capacity sized for the longest game we'll ever see (2048 plies = 1024
+    // full moves, well past any practical Cute Chess time control) plus the
+    // search's own MAX_PLY excursion on top, plus a small safety margin.
+    // state_stack is heap-allocated because each StateInfo carries a 1 KB
+    // NNUE accumulator: an inline array of this size would be ~2.4 MB and
+    // would blow Windows' default 1 MB thread stack for any local Board.
+    static constexpr int MAX_GAME_PLIES = 2048;
+    static constexpr int STATE_STACK_SIZE = MAX_GAME_PLIES + MAX_PLY + 32;
+
     Bitboard byType[PIECE_TYPE_NB];
     Bitboard byColor[COLOR_NB];
     Bitboard occupied;
@@ -88,10 +98,12 @@ private:
     Color stm;
     int game_ply;
     StateInfo* st;
-    StateInfo state_stack[MAX_PLY + 32];
+    std::unique_ptr<StateInfo[]> state_stack;
 
-    // Repetition history: keys of every position reached this game.
-    U64 history_keys[2048];
+    // Repetition history: keys of every position reached this game. Sized to
+    // match state_stack so a search at any in-game ply still has room for the
+    // MAX_PLY recursion on top before history_keys[++game_ply] would overflow.
+    std::unique_ptr<U64[]> history_keys;
 
     void put_piece(Piece p, int sq);
     void remove_piece(int sq);

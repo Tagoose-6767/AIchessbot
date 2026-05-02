@@ -107,6 +107,19 @@ inline uint32_t feature_idx(Color persp, Piece pc, int sq, int ksq_oriented) {
          + uint32_t(PS_END) * uint32_t(ksq_oriented);
 }
 
+// --- Search-dir / path-resolution helpers -----------------------------------
+std::string search_dir_;
+
+bool file_exists(const std::string& p) {
+    std::ifstream f(p, std::ios::binary);
+    return bool(f);
+}
+
+std::string basename_of(const std::string& p) {
+    size_t s = p.find_last_of("/\\");
+    return s == std::string::npos ? p : p.substr(s + 1);
+}
+
 // --- Stored weights ----------------------------------------------------------
 bool                 loaded_       = false;
 std::vector<int16_t> ft_biases_;     //                256
@@ -146,10 +159,34 @@ bool read_array(std::istream& s, std::vector<T>& v, size_t n) {
 
 namespace NNUE {
 
+const char* DEFAULT_NET = "nn-03744f8d56d8.nnue";
+
+void set_search_dir(const std::string& dir) { search_dir_ = dir; }
+
 bool load(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    // Try (in order): the path as given (CWD-relative); <search_dir>/path;
+    // <search_dir>/nets/<basename>; <search_dir>/<basename>. This makes the
+    // engine resilient to GUIs that launch it from a foreign working dir
+    // (e.g. Cute Chess from its own install folder).
+    std::string resolved = path;
+    if (!file_exists(resolved) && !search_dir_.empty()) {
+        std::string sep =
+            (search_dir_.back() == '/' || search_dir_.back() == '\\') ? "" : "/";
+        std::string base = basename_of(path);
+        std::string candidates[] = {
+            search_dir_ + sep + path,
+            search_dir_ + sep + "nets/" + base,
+            search_dir_ + sep + base,
+        };
+        for (const auto& c : candidates) {
+            if (file_exists(c)) { resolved = c; break; }
+        }
+    }
+
+    std::ifstream f(resolved, std::ios::binary);
     if (!f) {
-        std::cerr << "info string nnue: cannot open " << path << '\n';
+        std::cout << "info string nnue: cannot open " << path
+                  << " (search dir=\"" << search_dir_ << "\")\n";
         return false;
     }
 
@@ -158,7 +195,7 @@ bool load(const std::string& path) {
     uint32_t nn_hash  = read_le<uint32_t>(f);
     uint32_t arch_sz  = read_le<uint32_t>(f);
     if (!f || version != NN_VERSION) {
-        std::cerr << "info string nnue: bad version 0x" << std::hex << version
+        std::cout << "info string nnue: bad version 0x" << std::hex << version
                   << " (want 0x" << NN_VERSION << ")\n" << std::dec;
         return false;
     }
@@ -183,11 +220,11 @@ bool load(const std::string& path) {
     // Should be at EOF now.
     f.peek();
     if (!f.eof()) {
-        std::cerr << "info string nnue: trailing bytes after network — wrong size?\n";
+        std::cout << "info string nnue: trailing bytes after network -- wrong size?\n";
     }
 
     loaded_ = true;
-    std::cerr << "info string nnue: loaded " << path << '\n'
+    std::cout << "info string nnue: loaded " << resolved << '\n'
               << "info string nnue: arch=\"" << arch_string_ << "\"\n"
               << "info string nnue: header_hash=0x" << std::hex << nn_hash
               << " ft_hash=0x" << ft_hash

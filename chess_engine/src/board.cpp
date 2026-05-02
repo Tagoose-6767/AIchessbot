@@ -24,12 +24,20 @@ const int CASTLING_MASK[64] = {
     /* a8 */ 0xF & ~BLACK_OOO, 0xF, 0xF, 0xF, /* e8 */ 0xF & ~(BLACK_OO|BLACK_OOO), 0xF, 0xF, /* h8 */ 0xF & ~BLACK_OO,
 };
 
-Board::Board() { clear(); }
+Board::Board()
+    : state_stack(new StateInfo[STATE_STACK_SIZE]),
+      history_keys(new U64[STATE_STACK_SIZE]) {
+    clear();
+}
 
-// Deep-copy ctor: copy all bitboards/state, then fix up StateInfo pointers
-// (st and previous chains) so they point into THIS object's state_stack array
-// rather than the source's. Used by Lazy SMP to give each thread its own Board.
-Board::Board(const Board& o) {
+// Deep-copy ctor: allocate this Board's own heap storage, then rebase the
+// source's current state into our state_stack[0]. The previous-chain is
+// dropped — only the immediate previous is ever read (by NNUE incremental
+// update), and the search rebuilds the chain as it makes moves. Used by Lazy
+// SMP to give each thread its own Board.
+Board::Board(const Board& o)
+    : state_stack(new StateInfo[STATE_STACK_SIZE]),
+      history_keys(new U64[STATE_STACK_SIZE]) {
     *this = o;
 }
 
@@ -43,18 +51,17 @@ Board& Board::operator=(const Board& o) {
     king_square[1] = o.king_square[1];
     stm = o.stm;
     game_ply = o.game_ply;
-    for (int i = 0; i < 2048; ++i) history_keys[i] = o.history_keys[i];
+    for (int i = 0; i < STATE_STACK_SIZE; ++i) history_keys[i] = o.history_keys[i];
 
-    // Copy state stack and rebase pointers.
-    int st_idx = int(o.st - o.state_stack);
-    for (int i = 0; i <= st_idx; ++i) {
-        state_stack[i] = o.state_stack[i];
-        if (o.state_stack[i].previous != nullptr) {
-            intptr_t prev_idx = o.state_stack[i].previous - o.state_stack;
-            state_stack[i].previous = state_stack + prev_idx;
-        }
-    }
-    st = state_stack + st_idx;
+    // Rebase: only the source's CURRENT state is materially needed for search;
+    // the older chain entries are never read after copy (the previous-pointer
+    // is only chased one step deep, by NNUE update_after_move, and the search
+    // rebuilds that chain via its own make_move calls). Copying just the head
+    // and resetting the back-pointer makes copy O(1) regardless of game length
+    // and keeps st safely at index 0 of our local state_stack.
+    state_stack[0] = *o.st;
+    state_stack[0].previous = nullptr;
+    st = state_stack.get();
     return *this;
 }
 
@@ -66,7 +73,7 @@ void Board::clear() {
     king_square[0] = king_square[1] = SQ_NONE;
     stm = WHITE;
     game_ply = 0;
-    st = state_stack;
+    st = state_stack.get();
     st->castling_rights = 0;
     st->ep_square = SQ_NONE;
     st->halfmove_clock = 0;
