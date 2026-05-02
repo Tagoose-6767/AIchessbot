@@ -28,9 +28,15 @@ $(SRC_DIR)/fathom/tbprobe.o: CXXFLAGS += -Wno-all -Wno-extra -Wno-unused-but-set
     -Wno-implicit-fallthrough -Wno-deprecated-declarations \
     -Wno-class-memaccess -Wno-conversion-null -Wno-cast-function-type
 
-.PHONY: all debug clean perft bench
+.PHONY: all debug clean perft bench tuner
 
 all: $(EXE)
+
+# Texel tuner — links engine objects sans main.o.
+TUNER_OBJS := $(SRC_DIR)/board.o $(SRC_DIR)/movegen.o $(SRC_DIR)/evaluate.o \
+              $(SRC_DIR)/nnue.o $(SRC_DIR)/tt.o
+tuner: $(TUNER_OBJS) tuner/tuner.cpp
+	$(CXX) $(CXXFLAGS) -o tuner/tuner.exe tuner/tuner.cpp $(TUNER_OBJS) $(LDFLAGS)
 
 $(EXE): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $^

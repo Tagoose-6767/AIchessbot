@@ -5,136 +5,168 @@
 #include "movegen.h"
 #include "nnue.h"
 
+#include <algorithm>
+#include <cstring>
+
+// Mutable global parameter set. Default-initialized from the literal block
+// below at startup via evaluate_reload_weights() (called from a static ctor).
+EvalWeights g_eval;
+
 namespace {
 
+// === TEXEL-TUNED-WEIGHTS-BEGIN ===
+// Tuner edits the contents of this block in place. Keep formatting stable.
+
 // PeSTO MG/EG piece values.
-constexpr int MG_VAL[7] = { 0, 82, 337, 365, 477, 1025, 0 };
-constexpr int EG_VAL[7] = { 0, 94, 281, 297, 512,  936, 0 };
+constexpr int LIT_MG_VAL[7] = { 0, 101, 407, 421, 550, 1252, 0 };
+constexpr int LIT_EG_VAL[7] = { 0, 77, 297, 315, 561, 1005, 0 };
 
 // PeSTO piece-square tables. Index 0..63 in (file + rank*8) order.
-constexpr int PAWN_MG[64] = {
-      0,   0,   0,   0,   0,   0,   0,   0,
-    -35,  -1, -20, -23, -15,  24,  38, -22,
-    -26,  -4,  -4, -10,   3,   3,  33, -12,
-    -27,  -2,  -5,  12,  17,   6,  10, -25,
-    -14,  13,   6,  21,  23,  12,  17, -23,
-     -6,   7,  26,  31,  65,  56,  25, -20,
-     98, 134,  61,  95,  68, 126,  34, -11,
-      0,   0,   0,   0,   0,   0,   0,   0,
+constexpr int LIT_PAWN_MG[64] = {
+         0,     0,     0,     0,     0,     0,     0,     0,
+      -21,   -5,  -10,  -18,  -13,    25,    31,  -16,
+       -9,  -10,    10,   -2,    11,    18,    27,   -3,
+      -15,  -11,    11,    25,    30,    20,     2,  -20,
+       -2,    16,    17,    36,    38,    28,    18,  -13,
+        18,    13,    43,    37,    86,   104,    40,     9,
+        54,   112,    33,    87,    55,   106,  -35,  -95,
+         0,     0,     0,     0,     0,     0,     0,     0
 };
-constexpr int PAWN_EG[64] = {
-      0,   0,   0,   0,   0,   0,   0,   0,
-     13,   8,   8,  10,  13,   0,   2,  -7,
-      4,   7,  -6,   1,   0,  -5,  -1,  -8,
-     13,   9,  -3,  -7,  -7,  -8,   3,  -1,
-     32,  24,  13,   5,  -2,   4,  17,  17,
-     94, 100,  85,  67,  56,  53,  82,  84,
-    178, 173, 158, 134, 147, 132, 165, 187,
-      0,   0,   0,   0,   0,   0,   0,   0,
+constexpr int LIT_PAWN_EG[64] = {
+         0,     0,     0,     0,     0,     0,     0,     0,
+        34,    23,    27,    22,    31,    16,     8,     7,
+        25,    25,    12,    18,    18,    12,     6,     8,
+        37,    32,    14,     7,     7,     8,    17,    19,
+        49,    35,    21,     0,     5,    11,    26,    31,
+        69,    63,    33,   -3,  -23,     0,    36,    48,
+       163,   139,   124,    86,   103,    85,   147,   187,
+         0,     0,     0,     0,     0,     0,     0,     0
 };
-constexpr int KNIGHT_MG[64] = {
-   -105, -21, -58, -33, -17, -28, -19, -23,
-    -29, -53, -12,  -3,  -1,  18, -14, -19,
-    -23,  -9,  12,  10,  19,  17,  25, -16,
-    -13,   4,  16,  13,  28,  19,  21,  -8,
-     -9,  17,  19,  53,  37,  69,  18,  22,
-    -47,  60,  37,  65,  84, 129,  73,  44,
-    -73, -41,  72,  36,  23,  62,   7, -17,
-   -167, -89, -34, -49,  61, -97, -15,-107,
+constexpr int LIT_KNIGHT_MG[64] = {
+     -120,     4,  -28,   -4,    22,     5,     7,     3,
+       -8,  -28,    18,    32,    38,    42,    13,    12,
+       -7,    15,    31,    40,    50,    45,    51,     4,
+         7,    27,    37,    33,    50,    38,    45,    14,
+         7,    38,    29,    70,    48,    95,    38,    48,
+      -41,    74,    45,    77,   114,   153,   100,    62,
+      -80,  -37,    92,    33,    24,    83,     1,   -6,
+     -194, -105,  -61,  -49,    71, -113,  -23, -113
 };
-constexpr int KNIGHT_EG[64] = {
-    -29, -51, -23, -15, -22, -18, -50, -64,
-    -42, -20, -10,  -5,  -2, -20, -23, -44,
-    -23,  -3,  -1,  15,  10,  -3, -20, -22,
-    -18,  -6,  16,  25,  16,  17,   4, -18,
-    -17,   3,  22,  22,  22,  11,   8, -18,
-    -24, -20,  10,   9,  -1,  -9, -19, -41,
-    -25,  -8, -25,  -2,  -9, -25, -24, -52,
-    -58, -38, -13, -28, -31, -27, -63, -99,
+constexpr int LIT_KNIGHT_EG[64] = {
+         6,  -40,   -8,     2,  -12,   -9,  -41,  -58,
+      -23,   -6,     0,   -1,     0,  -13,  -10,  -39,
+      -12,     4,     0,    17,    12,   -5,  -17,  -10,
+       -4,     3,    21,    31,    20,    24,    15,   -8,
+       -4,    11,    31,    25,    28,     9,    15,  -11,
+      -11,  -16,    13,     8,  -13,  -18,  -24,  -41,
+       -8,     8,  -27,     8,   -4,  -30,  -12,  -43,
+      -35,  -22,     6,  -16,  -28,  -16,  -57,  -84
 };
-constexpr int BISHOP_MG[64] = {
-    -33,  -3, -14, -21, -13, -12, -39, -21,
-      4,  15,  16,   0,   7,  21,  33,   1,
-      0,  15,  15,  15,  14,  27,  18,  10,
-     -6,  13,  13,  26,  34,  12,  10,   4,
-     -4,   5,  19,  50,  37,  37,   7,  -2,
-    -16,  37,  43,  40,  35,  50,  37,  -2,
-    -26,  16, -18, -13,  30,  59,  18, -47,
-    -29,   4, -82, -37, -25, -42,   7,  -8,
+constexpr int LIT_BISHOP_MG[64] = {
+      -20,    17,     9,     5,    10,     5,  -37,  -12,
+        18,    39,    33,    22,    32,    35,    59,    17,
+        13,    32,    34,    21,    25,    50,    30,    22,
+         5,    22,    17,    40,    43,    13,    17,    17,
+         1,    13,    20,    58,    41,    35,    16,     6,
+      -24,    32,    45,    31,    41,    58,    32,   -7,
+      -31,    14,  -29,  -44,    21,    58,    26,  -51,
+      -36,  -18, -150, -109,  -77,  -69,  -34,     1
 };
-constexpr int BISHOP_EG[64] = {
-    -23,  -9, -23,  -5,  -9, -16,  -5, -17,
-    -14, -18,  -7,  -1,   4,  -9, -15, -27,
-    -12,  -3,   8,  10,  13,   3,  -7, -15,
-     -6,   3,  13,  19,   7,  10,  -3,  -9,
-     -3,   9,  12,   9,  14,  10,   3,   2,
-      2,  -8,   0,  -1,  -2,   6,   0,   4,
-     -8,  -4,   7, -12,  -3, -13,  -4, -14,
-    -14, -21, -11,  -8,  -7,  -9, -17, -24,
+constexpr int LIT_BISHOP_EG[64] = {
+      -11,   -1,  -14,     0,   -2,   -6,     9,   -9,
+       -7,  -18,   -8,   -4,   -4,   -6,  -19,  -28,
+       -5,   -1,     7,     9,    13,   -7,   -1,  -11,
+       -3,     1,    11,    12,   -1,     7,   -5,   -6,
+         1,    10,    10,     4,     7,     4,   -2,     3,
+         9,   -4,   -4,   -4,   -9,   -5,     3,     8,
+         0,   -3,    13,   -1,   -2,   -9,   -7,   -7,
+      -10,  -14,    13,    10,    13,     2,   -4,  -23
 };
-constexpr int ROOK_MG[64] = {
-    -19, -13,   1,  17,  16,   7, -37, -26,
-    -44, -16, -20,  -9,  -1,  11,  -6, -71,
-    -45, -25, -16, -17,   3,   0,  -5, -33,
-    -36, -26, -12,  -1,   9,  -7,   6, -23,
-    -24, -11,   7,  26,  24,  35,  -8, -20,
-     -5,  19,  26,  36,  17,  45,  61,  16,
-     27,  32,  58,  62,  80,  67,  26,  44,
-     32,  42,  32,  51,  63,   9,  31,  43,
+constexpr int LIT_ROOK_MG[64] = {
+         3,     4,    11,    22,    25,    31,   -9,    10,
+      -28,  -10,  -15,   -2,     9,    26,    15,  -49,
+      -38,  -20,  -15,  -19,   -3,    14,    11,  -16,
+      -39,  -34,  -23,  -17,   -2,   -2,    18,  -24,
+      -37,  -34,  -14,   -3,  -10,    33,  -11,  -25,
+      -24,   -9,   -7,   -4,  -27,    39,    77,     5,
+        10,     9,    49,    60,    80,    98,     4,    39,
+         9,    25,   -8,    42,    47,   -4,   -5,     3
 };
-constexpr int ROOK_EG[64] = {
-     -9,   2,   3,  -1,  -5, -13,   4, -20,
-     -6,  -6,   0,   2,  -9,  -9, -11,  -3,
-     -4,   0,  -5,  -1,  -7, -12,  -8, -16,
-      3,   5,   8,   4,  -5,  -6,  -8, -11,
-      4,   3,  13,   1,   2,   1,  -1,   2,
-      7,   7,   7,   5,   4,  -3,  -5,  -3,
-     11,  13,  13,  11,  -3,   3,   8,   3,
-     13,  10,  18,  15,  12,  12,   8,   5,
+constexpr int LIT_ROOK_EG[64] = {
+        12,    15,    16,     9,     4,     2,    11,  -10,
+        19,    13,    20,    21,     8,     3,     0,    21,
+        23,    23,    15,    20,    11,     4,     7,     6,
+        32,    33,    32,    26,    17,    14,     7,    18,
+        35,    32,    38,    24,    26,    18,    21,    32,
+        35,    33,    30,    30,    30,    12,     5,    18,
+        34,    35,    26,    20,     3,     8,    34,    24,
+        32,    24,    37,    22,    22,    32,    31,    30
 };
-constexpr int QUEEN_MG[64] = {
-     -1, -18,  -9,  10, -15, -25, -31, -50,
-    -35,  -8,  11,   2,   8,  15,  -3,   1,
-    -14,   2, -11,  -2,  -5,   2,  14,   5,
-     -9, -26,  -9, -10,  -2,  -4,   3,  -3,
-    -27, -27, -16, -16,  -1,  17,  -2,   1,
-    -13, -17,   7,   8,  29,  56,  47,  57,
-    -24, -39,  -5,   1, -16,  57,  28,  54,
-    -28,   0,  29,  12,  59,  44,  43,  45,
+constexpr int LIT_QUEEN_MG[64] = {
+        31,    30,    40,    54,    28,    19,    13,  -17,
+       -3,    21,    41,    39,    48,    51,    35,    48,
+         0,    26,     8,    15,    12,    19,    31,    25,
+         7,  -34,   -4,   -9,     0,     1,     3,     9,
+      -30,  -29,  -31,  -30,   -9,     2,   -4,     2,
+       -4,  -20,     7,  -28,    20,    78,    56,    71,
+      -17,  -44,  -17,  -22,  -52,    75,    49,    85,
+      -11,  -21,   -3,   -3,   132,   126,    95,    80
 };
-constexpr int QUEEN_EG[64] = {
-    -33, -28, -22, -43,  -5, -32, -20, -41,
-    -22, -23, -30, -16, -16, -23, -36, -32,
-    -16, -27,  15,   6,   9,  17,  10,   5,
-    -18,  28,  19,  47,  31,  34,  39,  23,
-      3,  22,  24,  45,  57,  40,  57,  36,
-    -20,   6,   9,  49,  47,  35,  19,   9,
-    -17,  20,  32,  41,  58,  25,  30,   0,
-     -9,  22,  22,  27,  27,  19,  10,  20,
+constexpr int LIT_QUEEN_EG[64] = {
+      -16,  -31,  -19,  -38,    10,  -13,   -3,  -23,
+         8,   -6,  -17,   -9,   -9,   -7,  -26,  -12,
+        29,  -17,    37,    19,    36,    45,    51,    48,
+        10,    79,    47,    80,    60,    66,    82,    61,
+        57,    60,    66,    83,    93,    82,   111,    94,
+        15,    47,    29,   106,    92,    55,    64,    40,
+        22,    61,    78,   100,   128,    51,    56,    25,
+        20,    79,    76,    76,    13,    12,     8,    47
 };
-constexpr int KING_MG[64] = {
-    -15,  36,  12, -54,   8, -28,  24,  14,
-      1,   7,  -8, -64, -43, -16,   9,   8,
-    -14, -14, -22, -46, -44, -30, -15, -27,
-    -49,  -1, -27, -39, -46, -44, -33, -51,
-    -17, -20, -12, -27, -30, -25, -14, -36,
-     -9,  24,   2, -16, -20,   6,  22, -22,
-     29,  -1, -20,  -7,  -8,  -4, -38, -29,
-    -65,  23,  16, -15, -56, -34,   2,  13,
+constexpr int LIT_KING_MG[64] = {
+      -18,    44,    27,  -62,    11,  -35,    38,    27,
+       -4,     0,  -30,  -86,  -68,  -50,   -1,    11,
+      -24,  -30,  -50,  -82,  -88,  -83,  -41,  -60,
+      -91,     9,  -72, -115, -128,  -99, -104, -124,
+      -15,  -24,    15,  -49,  -58,  -51,  -39, -115,
+        63,    66,    97,    30,    65,   114,   128,  -33,
+       197,    84,    33,   117,    43,    27,  -25, -153,
+     -146,   192,   187,   112, -134,  -73,    70,    14
 };
-constexpr int KING_EG[64] = {
-    -53, -34, -21, -11, -28, -14, -24, -43,
-    -27, -11,   4,  13,  14,   4,  -5, -17,
-    -19,  -3,  11,  21,  23,  16,   7,  -9,
-    -18,  -4,  21,  24,  27,  23,   9, -11,
-     -8,  22,  24,  27,  26,  33,  26,   3,
-     10,  17,  23,  15,  20,  45,  44,  13,
-    -12,  17,  14,  17,  17,  38,  23,  11,
-    -74, -35, -18, -18, -11,  15,   4, -17,
+constexpr int LIT_KING_EG[64] = {
+      -71,  -53,  -27,   -1,  -28,   -6,  -41,  -72,
+      -35,  -11,    16,    32,    32,    21,   -5,  -30,
+      -22,     4,    26,    42,    46,    36,    14,   -3,
+      -11,   -3,    39,    52,    56,    45,    29,     5,
+      -16,    28,    27,    42,    42,    48,    38,    18,
+       -9,    12,    11,    13,     9,    36,    29,    13,
+      -59,   -1,    10,   -1,    13,    38,    29,    33,
+      -77,  -79,  -60,  -44,     8,    26,  -14,  -31
 };
 
-const int* PST_MG[7] = { nullptr, PAWN_MG, KNIGHT_MG, BISHOP_MG, ROOK_MG, QUEEN_MG, KING_MG };
-const int* PST_EG[7] = { nullptr, PAWN_EG, KNIGHT_EG, BISHOP_EG, ROOK_EG, QUEEN_EG, KING_EG };
+// Pawn structure / king safety / mobility / misc weights.
+constexpr int LIT_PASSED_MG[8] = { 0, -2, -8, -11, 6, 12, 64, 0 };
+constexpr int LIT_PASSED_EG[8] = { 0, -3, 2, 26, 55, 129, 118, 0 };
+constexpr int LIT_CONNECTED_PASSED_MG = 13;
+constexpr int LIT_CONNECTED_PASSED_EG = 11;
+constexpr int LIT_DOUBLED_MG = -1;
+constexpr int LIT_DOUBLED_EG = -8;
+constexpr int LIT_ISOLATED_MG = -19;
+constexpr int LIT_ISOLATED_EG = -6;
+constexpr int LIT_ROOK_OPEN_MG = 63;
+constexpr int LIT_ROOK_OPEN_EG = -12;
+constexpr int LIT_ROOK_SEMI_MG = 19;
+constexpr int LIT_ROOK_SEMI_EG = 14;
+constexpr int LIT_KING_SHELTER_CLOSE = 12;
+constexpr int LIT_KING_SHELTER_FAR = 6;
+constexpr int LIT_KING_SHELTER_MISSING = -20;
+constexpr int LIT_KING_SHELTER_BEHIND = 21;
+constexpr int LIT_MOBILITY_MG = 4;
+constexpr int LIT_MOBILITY_EG = 3;
+constexpr int LIT_BISHOP_PAIR_MG = 32;
+constexpr int LIT_BISHOP_PAIR_EG = 54;
+constexpr int LIT_TEMPO = 21;
+
+// === TEXEL-TUNED-WEIGHTS-END ===
 
 // Phase weight per piece type. Sums to 24 in the starting position; we use it
 // to interpolate MG -> EG.
@@ -160,12 +192,9 @@ struct PassedMasks {
 };
 const PassedMasks passed_masks;
 
-constexpr int PASSED_BONUS_MG[8] = { 0, 5, 10, 20, 35, 60, 100, 0 };
-constexpr int PASSED_BONUS_EG[8] = { 0, 10, 20, 35, 60, 100, 150, 0 };
-
 inline int pst_value(Color c, PieceType pt, int sq, bool eg) {
     int idx = c == WHITE ? sq : sq ^ 56;
-    return eg ? PST_EG[pt][idx] : PST_MG[pt][idx];
+    return eg ? g_eval.pst_eg[pt][idx] : g_eval.pst_mg[pt][idx];
 }
 
 int pawn_structure_term(const Board& b, Color us, bool eg) {
@@ -185,15 +214,15 @@ int pawn_structure_term(const Board& b, Color us, bool eg) {
         int f = file_of(sq), r = rank_of(sq);
         int rel = us == WHITE ? r : 7 - r;
 
-        if (file_count[f] > 1) score += eg ? -20 : -10;
+        if (file_count[f] > 1) score += eg ? g_eval.doubled_eg : g_eval.doubled_mg;
 
         bool isolated = true;
         if (f > 0 && file_count[f - 1] > 0) isolated = false;
         if (f < 7 && file_count[f + 1] > 0) isolated = false;
-        if (isolated) score += eg ? -10 : -15;
+        if (isolated) score += eg ? g_eval.isolated_eg : g_eval.isolated_mg;
 
         if (!(passed_masks.m[us][sq] & opp)) {
-            score += eg ? PASSED_BONUS_EG[rel] : PASSED_BONUS_MG[rel];
+            score += eg ? g_eval.passed_eg[rel] : g_eval.passed_mg[rel];
             // Connected passers
             Bitboard adj = 0;
             if (f > 0) adj |= file_bb(f - 1);
@@ -201,7 +230,7 @@ int pawn_structure_term(const Board& b, Color us, bool eg) {
             Bitboard near_ranks = rank_bb(r);
             if (r > 0) near_ranks |= rank_bb(r - 1);
             if (r < 7) near_ranks |= rank_bb(r + 1);
-            if (own & adj & near_ranks) score += eg ? 20 : 10;
+            if (own & adj & near_ranks) score += eg ? g_eval.connected_passed_eg : g_eval.connected_passed_mg;
         }
     }
     return score;
@@ -216,8 +245,8 @@ int rook_files_term(const Board& b, Color us, bool eg) {
         int sq = pop_lsb(rooks);
         Bitboard fbb = file_bb(file_of(sq));
         if (!(fbb & own_p)) {
-            if (!(fbb & opp_p)) score += eg ? 15 : 25;
-            else                score += eg ? 7  : 12;
+            if (!(fbb & opp_p)) score += eg ? g_eval.rook_open_eg : g_eval.rook_open_mg;
+            else                score += eg ? g_eval.rook_semi_eg : g_eval.rook_semi_mg;
         }
     }
     return score;
@@ -232,7 +261,7 @@ int king_safety_term(const Board& b, Color us) {
     int lo_f = std::max(0, f - 1), hi_f = std::min(7, f + 1);
     for (int ff = lo_f; ff <= hi_f; ff++) {
         Bitboard col = file_bb(ff) & own_pawns;
-        if (!col) { score -= 25; continue; }
+        if (!col) { score += g_eval.king_shelter_missing; continue; }
         int p_sq;
         int rel;
         if (us == WHITE) {
@@ -242,9 +271,9 @@ int king_safety_term(const Board& b, Color us) {
             p_sq = msb(col);
             rel = kr - rank_of(p_sq);
         }
-        if (rel == 1) score += 5;
-        else if (rel == 2) score += 2;
-        else if (rel <= 0) score -= 15;
+        if (rel == 1)      score += g_eval.king_shelter_close;
+        else if (rel == 2) score += g_eval.king_shelter_far;
+        else if (rel <= 0) score += g_eval.king_shelter_behind;
     }
     return score;
 }
@@ -277,15 +306,60 @@ int mobility_term(const Board& b, Color us, bool eg) {
         Bitboard atts = queen_attacks(sq, occ) & ~us_bb;
         total += popcount(atts);
     }
-    return eg ? total * 2 : total * 3;
+    return total * (eg ? g_eval.mobility_eg : g_eval.mobility_mg);
 }
 
 }  // namespace
 
-int evaluate(const Board& b) {
-    // Dispatch: NNUE if a network is loaded, otherwise the hand-crafted eval.
-    if (NNUE::is_loaded()) return NNUE::evaluate(b);
+void evaluate_reload_weights() {
+    std::memset(&g_eval, 0, sizeof(g_eval));
+    for (int pt = 0; pt < 7; ++pt) {
+        g_eval.mg_val[pt] = LIT_MG_VAL[pt];
+        g_eval.eg_val[pt] = LIT_EG_VAL[pt];
+    }
+    auto copy_pst = [&](int pt, const int* mg, const int* eg) {
+        for (int sq = 0; sq < 64; sq++) {
+            g_eval.pst_mg[pt][sq] = mg[sq];
+            g_eval.pst_eg[pt][sq] = eg[sq];
+        }
+    };
+    copy_pst(PAWN,   LIT_PAWN_MG,   LIT_PAWN_EG);
+    copy_pst(KNIGHT, LIT_KNIGHT_MG, LIT_KNIGHT_EG);
+    copy_pst(BISHOP, LIT_BISHOP_MG, LIT_BISHOP_EG);
+    copy_pst(ROOK,   LIT_ROOK_MG,   LIT_ROOK_EG);
+    copy_pst(QUEEN,  LIT_QUEEN_MG,  LIT_QUEEN_EG);
+    copy_pst(KING,   LIT_KING_MG,   LIT_KING_EG);
+    for (int r = 0; r < 8; r++) {
+        g_eval.passed_mg[r] = LIT_PASSED_MG[r];
+        g_eval.passed_eg[r] = LIT_PASSED_EG[r];
+    }
+    g_eval.connected_passed_mg = LIT_CONNECTED_PASSED_MG;
+    g_eval.connected_passed_eg = LIT_CONNECTED_PASSED_EG;
+    g_eval.doubled_mg = LIT_DOUBLED_MG;
+    g_eval.doubled_eg = LIT_DOUBLED_EG;
+    g_eval.isolated_mg = LIT_ISOLATED_MG;
+    g_eval.isolated_eg = LIT_ISOLATED_EG;
+    g_eval.rook_open_mg = LIT_ROOK_OPEN_MG;
+    g_eval.rook_open_eg = LIT_ROOK_OPEN_EG;
+    g_eval.rook_semi_mg = LIT_ROOK_SEMI_MG;
+    g_eval.rook_semi_eg = LIT_ROOK_SEMI_EG;
+    g_eval.king_shelter_close = LIT_KING_SHELTER_CLOSE;
+    g_eval.king_shelter_far = LIT_KING_SHELTER_FAR;
+    g_eval.king_shelter_missing = LIT_KING_SHELTER_MISSING;
+    g_eval.king_shelter_behind = LIT_KING_SHELTER_BEHIND;
+    g_eval.mobility_mg = LIT_MOBILITY_MG;
+    g_eval.mobility_eg = LIT_MOBILITY_EG;
+    g_eval.bishop_pair_mg = LIT_BISHOP_PAIR_MG;
+    g_eval.bishop_pair_eg = LIT_BISHOP_PAIR_EG;
+    g_eval.tempo = LIT_TEMPO;
+}
 
+namespace {
+struct WeightInit { WeightInit() { evaluate_reload_weights(); } };
+WeightInit weight_init_;
+}  // namespace
+
+int evaluate_hce(const Board& b) {
     int mg[2] = { 0, 0 };
     int eg[2] = { 0, 0 };
     int phase = 0;
@@ -295,8 +369,8 @@ int evaluate(const Board& b) {
         for (int pt = PAWN; pt <= KING; pt++) {
             Bitboard bb = b.pieces(col, PieceType(pt));
             int n = popcount(bb);
-            mg[c] += n * MG_VAL[pt];
-            eg[c] += n * EG_VAL[pt];
+            mg[c] += n * g_eval.mg_val[pt];
+            eg[c] += n * g_eval.eg_val[pt];
             phase += n * PHASE[pt];
             while (bb) {
                 int sq = pop_lsb(bb);
@@ -305,7 +379,7 @@ int evaluate(const Board& b) {
             }
         }
         if (popcount(b.pieces(col, BISHOP)) >= 2) {
-            mg[c] += 30; eg[c] += 50;
+            mg[c] += g_eval.bishop_pair_mg; eg[c] += g_eval.bishop_pair_eg;
         }
         mg[c] += pawn_structure_term(b, col, false);
         eg[c] += pawn_structure_term(b, col, true);
@@ -322,7 +396,12 @@ int evaluate(const Board& b) {
     int score = (mg_score * phase + eg_score * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
 
     // Tempo bonus
-    score += (b.side_to_move() == WHITE ? 10 : -10);
+    score += (b.side_to_move() == WHITE ? g_eval.tempo : -g_eval.tempo);
 
     return b.side_to_move() == WHITE ? score : -score;
+}
+
+int evaluate(const Board& b) {
+    if (NNUE::is_loaded()) return NNUE::evaluate(b);
+    return evaluate_hce(b);
 }
